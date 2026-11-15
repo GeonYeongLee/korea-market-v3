@@ -1,0 +1,17 @@
+# Core Data Science & Numeric Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+
+# Settings, API & Network Communication
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+websockets>=12.0
+pycryptodome>=3.20.0
+
+# CLI, Logging & Rich Terminal UI
+rich>=13.0.0
+
+# Testing & Verification
+pytest>=8.0.0

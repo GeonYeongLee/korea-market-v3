@@ -1,0 +1,220 @@
+"""
+Dynamic Feature Provider for Korea Market v3.
+Provides volatility (ATR20), liquidity (ADTO20), and market regime features.
+Strict Causal Invariant (Lookahead 0%): All indicators for day t strictly
+originate from day t-1 or earlier.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from datetime import date
+from typing import Dict, Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger("korea_market.core.dynamic_features")
+
+DEFAULT_MARKET_GAP_STD: float = 0.85
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolDynamicFeatures:
+    prior_atr20_pct: float
+    prior_adto20: float
+
+
+@dataclass(frozen=True, slots=True)
+class IndexDynamicFeatures:
+    ks_trend: float
+    kq_trend: float
+    market_gap_std20: float
+    is_bear_market: bool
+    dynamic_max_gap: float
+
+
+class DynamicFeatureProvider:
+    """
+    Caches and serves stock-level (ATR20, ADTO20) and market-level
+    dynamic features with guaranteed 0% lookahead.
+    """
+
+    def __init__(
+        self,
+        daily_file: str = "data/dataset_2y/daily_bars_2y.parquet",
+        index_file: str = "data/dataset_2y/index_daily.parquet",
+        default_atr20_pct: float = 0.080,
+        default_adto20: float = 10_000_000_000.0,
+    ):
+        self.daily_file = daily_file
+        self.index_file = index_file
+        self.default_atr20_pct = default_atr20_pct
+        self.default_adto20 = default_adto20
+
+        self._stock_features_by_date: Dict[str, Dict[str, SymbolDynamicFeatures]] = {}
+        self._index_features_by_date: Dict[str, IndexDynamicFeatures] = {}
+        self._latest_index_date: Optional[str] = None
+        self._is_loaded: bool = False
+
+    @staticmethod
+    def _to_date_str(d: object) -> str:
+        if hasattr(d, "strftime"):
+            return d.strftime("%Y-%m-%d")
+        return str(d)[:10]
+
+    def load(self) -> None:
+        """Precomputes and caches all dynamic features with strict shift(1) lookahead guard."""
+        if self._is_loaded:
+            return
+
+        self._load_stock_features()
+        self._load_index_features()
+        self._is_loaded = True
+
+    def _load_stock_features(self) -> None:
+        if not os.path.exists(self.daily_file):
+            logger.warning(f"Daily file not found: {self.daily_file}")
+            return
+
+        try:
+            cols = ["date", "symbol", "high", "low", "close", "prev_close", "turnover", "adto20"]
+            df = pd.read_parquet(self.daily_file, columns=cols)
+            df["date_str"] = df["date"].astype(str)
+            df = df.sort_values(["symbol", "date_str"]).reset_index(drop=True)
+
+            # True Range: max(H-L, |H-PC|, |L-PC|)
+            pc = df["prev_close"].fillna(df["close"])
+            tr = np.maximum(df["high"] - df["low"], np.maximum(np.abs(df["high"] - pc), np.abs(df["low"] - pc)))
+            df["tr"] = tr
+
+            # Groupby rolling 20 days
+            g = df.groupby("symbol", sort=False)
+            df["atr20"] = g["tr"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
+            # Strict Lookahead 0%: shift(1) relative to day t
+            prior_atr = g["atr20"].shift(1)
+            prior_close = g["close"].shift(1)
+            df["prior_atr20_pct"] = (prior_atr / prior_close).replace([np.inf, -np.inf], np.nan)
+            df["prior_adto20"] = g["adto20"].shift(1)
+
+            clean = df.dropna(subset=["prior_atr20_pct", "prior_adto20"])
+            for d_str, sub in clean.groupby("date_str", sort=False):
+                syms = sub["symbol"].values
+                atrs = sub["prior_atr20_pct"].values
+                adtos = sub["prior_adto20"].values
+                day_dict: Dict[str, SymbolDynamicFeatures] = {}
+                for s, a, ad in zip(syms, atrs, adtos):
+                    if np.isfinite(a) and a > 0.0 and np.isfinite(ad) and ad > 0.0:
+                        day_dict[s] = SymbolDynamicFeatures(prior_atr20_pct=float(a), prior_adto20=float(ad))
+                self._stock_features_by_date[d_str] = day_dict
+
+            logger.info(f"Loaded stock dynamic features for {len(self._stock_features_by_date)} trading dates.")
+        except Exception as e:
+            logger.warning(f"Failed to load stock features from {self.daily_file}: {e}")
+
+    def _load_index_features(self) -> None:
+        if not os.path.exists(self.index_file):
+            logger.warning(f"Index file not found: {self.index_file}")
+            return
+
+        try:
+            df_idx = pd.read_parquet(self.index_file)
+            required_cols = {"date", "ks_close", "ks_ma20", "kq_close", "kq_ma20", "ks_gap_pct"}
+            if not required_cols.issubset(df_idx.columns):
+                logger.warning(
+                    f"Index file {self.index_file} missing required columns: {required_cols - set(df_idx.columns)}"
+                )
+                return
+
+            df_idx["date_str"] = pd.to_datetime(df_idx["date"]).dt.strftime("%Y-%m-%d")
+            df_idx = df_idx.sort_values("date_str").reset_index(drop=True)
+            if df_idx.empty:
+                return
+
+            # Trend as of day t-1
+            ks_trend = ((df_idx["ks_close"] - df_idx["ks_ma20"]) / df_idx["ks_ma20"]).shift(1)
+            kq_trend = ((df_idx["kq_close"] - df_idx["kq_ma20"]) / df_idx["kq_ma20"]).shift(1)
+
+            # Gap standard deviation (in % points) over 20 rolling days as of day t-1
+            gap_std = (
+                df_idx["ks_gap_pct"].shift(1).rolling(20, min_periods=5).std().fillna(DEFAULT_MARKET_GAP_STD)
+            )
+
+            for _, row in df_idx.iterrows():
+                d_str = row["date_str"]
+                kt = ks_trend.loc[row.name]
+                qt = kq_trend.loc[row.name]
+                gs = gap_std.loc[row.name]
+
+                eff_kt = float(kt) if pd.notna(kt) else 0.0
+                eff_qt = float(qt) if pd.notna(qt) else 0.0
+                eff_gs = float(gs) if pd.notna(gs) and gs > 0 else DEFAULT_MARKET_GAP_STD
+
+                # Bear Market Defense: Both KOSPI and KOSDAQ below MA20 on t-1
+                is_bear = (eff_kt < 0.0) and (eff_qt < 0.0)
+
+                # Dynamic Max Gap: clip(1.0 * std, 0.50%, 1.75%)
+                dyn_gap = float(np.clip(1.0 * eff_gs, 0.50, 1.75))
+
+                self._index_features_by_date[d_str] = IndexDynamicFeatures(
+                    ks_trend=eff_kt,
+                    kq_trend=eff_qt,
+                    market_gap_std20=eff_gs,
+                    is_bear_market=is_bear,
+                    dynamic_max_gap=dyn_gap,
+                )
+
+            self._latest_index_date = (
+                max(self._index_features_by_date.keys()) if self._index_features_by_date else None
+            )
+            logger.info(f"Loaded index dynamic features for {len(self._index_features_by_date)} trading dates.")
+        except Exception as e:
+            logger.warning(f"Failed to load index features from {self.index_file}: {e}")
+
+    def get_stock_features(self, current_date: date | str, symbol: str) -> SymbolDynamicFeatures:
+        """Returns SymbolDynamicFeatures for symbol on current_date, with safe fallback."""
+        if not self._is_loaded:
+            self.load()
+        d_str = self._to_date_str(current_date)
+        day_dict = self._stock_features_by_date.get(d_str)
+        if day_dict and symbol in day_dict:
+            return day_dict[symbol]
+        return SymbolDynamicFeatures(prior_atr20_pct=self.default_atr20_pct, prior_adto20=self.default_adto20)
+
+    def get_day_stock_features(self, current_date: date | str) -> Dict[str, SymbolDynamicFeatures]:
+        """Returns full dictionary of symbol dynamic features for current_date."""
+        if not self._is_loaded:
+            self.load()
+        d_str = self._to_date_str(current_date)
+        return self._stock_features_by_date.get(d_str, {})
+
+    def get_index_features(self, current_date: date | str) -> IndexDynamicFeatures:
+        """Returns IndexDynamicFeatures for current_date, with safe fallback."""
+        if not self._is_loaded:
+            self.load()
+        d_str = self._to_date_str(current_date)
+        if d_str in self._index_features_by_date:
+            return self._index_features_by_date[d_str]
+
+        # Fallback for dates beyond index_daily range
+        if self._latest_index_date and d_str > self._latest_index_date:
+            return self._index_features_by_date[self._latest_index_date]
+
+        return IndexDynamicFeatures(
+            ks_trend=0.0,
+            kq_trend=0.0,
+            market_gap_std20=DEFAULT_MARKET_GAP_STD,
+            is_bear_market=False,
+            dynamic_max_gap=DEFAULT_MARKET_GAP_STD,
+        )
+
+
+_default_provider: Optional[DynamicFeatureProvider] = None
+
+
+def get_default_dynamic_feature_provider() -> DynamicFeatureProvider:
+    global _default_provider
+    if _default_provider is None:
+        _default_provider = DynamicFeatureProvider()
+    return _default_provider

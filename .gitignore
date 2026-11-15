@@ -1,0 +1,28 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+.kis_tokens/
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & Runtime telemetry
+logs/
+*.log
+
+# Data & Output
+data/
+reports/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
