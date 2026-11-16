@@ -240,10 +240,12 @@ class CompositeStrategy(BaseStrategy):
                         f"Collar Cap: {entry_signal.collar_cap_price:,.0f} | Qty: {qty} shares"
                     )
                     prior_atr = entry_signal.metadata.get("prior_atr20_pct")
+                    anchor_info = entry_signal.metadata.get("anchor_info")
                     ref_bar = {
                         "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close,
                         "dt": bar.dt, "turnover": bar.turnover, "volume": bar.volume,
                         "prior_atr20_pct": prior_atr,
+                        "anchor_info": anchor_info,
                     }
                     self._pending_ref_bars[bar.symbol] = ref_bar
                     order_id = context.buy(
@@ -255,6 +257,8 @@ class CompositeStrategy(BaseStrategy):
                         pos = context.get_position(bar.symbol)
                         if pos:
                             pos.metadata.setdefault("ref_bar", ref_bar)
+                            if anchor_info:
+                                pos.metadata.setdefault("anchor_info", anchor_info)
                             if prior_atr is not None:
                                 pos.metadata.setdefault("prior_atr20_pct", prior_atr)
                     else:
@@ -281,6 +285,8 @@ class CompositeStrategy(BaseStrategy):
                     ref_bar = self._pending_ref_bars.pop(event.symbol, None)
                     if ref_bar:
                         position.metadata.setdefault("ref_bar", ref_bar)
+                        if ref_bar.get("anchor_info"):
+                            position.metadata.setdefault("anchor_info", ref_bar["anchor_info"])
                         if ref_bar.get("prior_atr20_pct") is not None:
                             position.metadata.setdefault("prior_atr20_pct", ref_bar["prior_atr20_pct"])
                     self.exit_policy.on_position_opened(position)

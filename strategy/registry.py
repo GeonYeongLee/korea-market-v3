@@ -8,22 +8,28 @@ from typing import Dict, Type, Any, Optional
 from strategy.base import IScanner, IEntryRule, IExitPolicy
 from strategy.composite import CompositeStrategy
 from strategy.scanners.morning_leader_scanner import MorningLeaderScanner
+from strategy.scanners.anchor_scanner import AnchorScanner
 from strategy.entries.morning_breakout_entry import MorningBreakoutEntry
+from strategy.entries.anchor_breakout_entry import AnchorBreakoutEntry
 from strategy.exits.morning_leader_exit import MorningLeaderExit
 from strategy.exits.dynamic_leader_exit import DynamicLeaderExit
+from strategy.exits.anchor_dynamic_exit import AnchorDynamicExit
 
 
 SCANNERS: Dict[str, Type[IScanner]] = {
     "morning_leader": MorningLeaderScanner,
+    "anchor": AnchorScanner,
 }
 
 ENTRIES: Dict[str, Type[IEntryRule]] = {
     "morning_breakout": MorningBreakoutEntry,
+    "anchor_breakout": AnchorBreakoutEntry,
 }
 
 EXITS: Dict[str, Type[IExitPolicy]] = {
     "morning_leader": MorningLeaderExit,
     "dynamic_leader": DynamicLeaderExit,
+    "anchor_dynamic": AnchorDynamicExit,
 }
 
 
@@ -81,6 +87,8 @@ def build_strategy(
         x_kwargs["use_dynamic_targets"] = exit_flag
 
     scanner = SCANNERS[scanner_name](**s_kwargs)
+    if "scanner" not in e_kwargs and hasattr(scanner, "get_anchor_info"):
+        e_kwargs["scanner"] = scanner
     entry = ENTRIES[entry_name](**e_kwargs)
     exit_policy = EXITS[exit_name](**x_kwargs)
 
