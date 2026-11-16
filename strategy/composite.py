@@ -9,6 +9,7 @@ import logging
 from datetime import date, time
 from typing import Optional, List, Dict, Set, Any
 
+from core.krx_ticks import get_krx_tick_size
 from core.market_regime import MarketRegimeProvider, get_default_market_regime_provider
 from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_feature_provider
 from engine.models import MinuteBar, TickData, OrderEvent, OrderStatus, OrderSide, Position
@@ -227,10 +228,12 @@ class CompositeStrategy(BaseStrategy):
             ctx_state = {"day_open": day_open} if day_open else None
             entry_signal = self.entry.evaluate_entry(bar.symbol, bar, context_state=ctx_state)
             if entry_signal and self.current_slot_notional > 0 and entry_signal.collar_cap_price > 0:
-                target_qty = int(self.current_slot_notional // entry_signal.collar_cap_price)
+                tick_buf = get_krx_tick_size(entry_signal.collar_cap_price)
+                max_price = entry_signal.collar_cap_price + tick_buf
+                target_qty = int(self.current_slot_notional // max_price)
                 bal = context.get_balance() if hasattr(context, "get_balance") else None
                 if bal and bal.cash > 0:
-                    max_affordable_qty = int(bal.cash // entry_signal.collar_cap_price)
+                    max_affordable_qty = int(bal.cash // max_price)
                     qty = min(target_qty, max_affordable_qty)
                 else:
                     qty = target_qty

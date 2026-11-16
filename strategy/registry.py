@@ -9,27 +9,33 @@ from strategy.base import IScanner, IEntryRule, IExitPolicy
 from strategy.composite import CompositeStrategy
 from strategy.scanners.morning_leader_scanner import MorningLeaderScanner
 from strategy.scanners.anchor_scanner import AnchorScanner
+from strategy.scanners.anchor_close_scanner import AnchorCloseScanner
 from strategy.entries.morning_breakout_entry import MorningBreakoutEntry
 from strategy.entries.anchor_breakout_entry import AnchorBreakoutEntry
+from strategy.entries.anchor_close_entry import AnchorCloseEntry
 from strategy.exits.morning_leader_exit import MorningLeaderExit
 from strategy.exits.dynamic_leader_exit import DynamicLeaderExit
 from strategy.exits.anchor_dynamic_exit import AnchorDynamicExit
+from strategy.exits.anchor_morning_exit import AnchorMorningExit
 
 
 SCANNERS: Dict[str, Type[IScanner]] = {
     "morning_leader": MorningLeaderScanner,
     "anchor": AnchorScanner,
+    "anchor_close": AnchorCloseScanner,
 }
 
 ENTRIES: Dict[str, Type[IEntryRule]] = {
     "morning_breakout": MorningBreakoutEntry,
     "anchor_breakout": AnchorBreakoutEntry,
+    "anchor_close": AnchorCloseEntry,
 }
 
 EXITS: Dict[str, Type[IExitPolicy]] = {
     "morning_leader": MorningLeaderExit,
     "dynamic_leader": DynamicLeaderExit,
     "anchor_dynamic": AnchorDynamicExit,
+    "anchor_morning": AnchorMorningExit,
 }
 
 
