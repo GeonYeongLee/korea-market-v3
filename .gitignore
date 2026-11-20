@@ -1,27 +1,115 @@
+# ==============================================================================
 # Environment & Secrets
+# ==============================================================================
 .env
 .env.*
 !.env.example
 .kis_tokens/
 
-# Python cache & artifacts
+# ==============================================================================
+# Python cache, testing & runtime telemetry
+# ==============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
-
-# Logs & Runtime telemetry
+.mypy_cache/
+.ruff_cache/
 logs/
 *.log
 
-# Data & Output
+# ==============================================================================
+# Data & Persistent Baseline Storage (Preserved on disk, excluded from git)
+# ==============================================================================
 data/
 reports/
 
-# IDE & OS
+# ==============================================================================
+# Research & Parameter Sweeps (Transient caches, large candidate pools & grid search dumps)
+# ==============================================================================
+research/*.parquet
+research/*.csv
+!research/golden_25_decoupled_trades_2020_2026.csv
+!research/q1_anchor_grid.csv
+!research/q2_position_low_break.csv
+!research/q3_q4_trades.csv
+
+# Temporary test caches, scratch dumps & editor backups
+*.tmp
+*.temp
+*.bak
+*~
+
+# ==============================================================================
+# Research Ad-Hoc Exploratory & Diagnostic Scripts (Preserved locally, cataloged in research/README.md)
+# ==============================================================================
+research/check_*.py
+research/inspect_*.py
+research/diagnose_*.py
+research/diagnostic_*.py
+research/quick_*.py
+research/search_*.py
+research/read_*.py
+research/debug_*.py
+research/slip_*.py
+research/deep_dive_*.py
+research/ideation_*.py
+research/mine_*.py
+research/clarify_*.py
+research/summarize_*.py
+research/save_*.py
+research/slots_*.py
+research/advance_*.py
+research/evaluate_*.py
+research/explore_*.py
+research/compare_*.py
+research/find_*.py
+research/analyze_508_*.py
+research/analyze_anchor_*.py
+research/analyze_exit_*.py
+research/analyze_monthly_*.py
+research/analyze_nxt_*.py
+research/analyze_open_*.py
+research/audit_a2_*.py
+research/audit_historical_*.py
+research/audit_lookahead_*.py
+research/audit_regime_*.py
+research/audit_swing_*.py
+research/factor_*.py
+research/fast_quant_*.py
+research/fine_grid_*.py
+research/grid_search_turnover_*.py
+research/grid_search_fixed_*.py
+research/test_*.py
+research/run_*.py
+research/calibrate_*.py
+research/compute_*.py
+research/deep_*.py
+research/optimize_*.py
+research/verify_*.py
+
+# Whitelist: Core Champion B Anchor Strategy Research & Tracked Modules
+!research/calibrate_target_candidates.py
+!research/run_2020_2026_exhaustive_backtest.py
+!research/run_all_years_backtest.py
+!research/run_final_champion_benchmark.py
+!research/optimize_model2_close_betting.py
+!research/run_full_2year_refined_backtest.py
+!research/test_anchor_with_morning_exit.py
+!research/test_anchor_with_morning_leader_power.py
+!research/test_direct_tp_vs_stepup.py
+!research/test_filter_combinations.py
+!research/test_prebreakout_entry.py
+!research/test_pullback_rebound.py
+!research/test_the_real_anchor_alphas.py
+
+# ==============================================================================
+# IDE & Operating System Artifacts
+# ==============================================================================
 .vscode/
 .idea/
 .DS_Store

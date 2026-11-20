@@ -1,16 +1,18 @@
 """
 Deterministic Backtest Broker with Pessimistic Bar Execution.
+=============================================================
 Enforces realistic KRX microstructure:
   - 0.18% statutory securities transaction tax (sell side)
-  - 0.014% online commission (both sides)
-  - 0.035% execution slippage (~1 KRX tick)
-  - Strict pessimistic resolution of ambiguous bars (Stop-loss prioritized over take-profit)
-  - KRX statutory tick rounding on all filled prices
+  - 0.014% online brokerage commission (both buy & sell sides)
+  - 0.035% execution slippage (~1 KRX tick) with adverse tick rounding
+  - Pessimistic resolution of ambiguous bars (Stop-loss prioritized over take-profit)
+  - KRX statutory tick rounding on all filled prices (BUY: ceil, SELL: floor)
 """
 from __future__ import annotations
 
 import uuid
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Callable
 
@@ -25,6 +27,8 @@ logger = logging.getLogger("korea_market.broker.backtest")
 
 
 class BacktestBroker(IBroker):
+    """Pessimistic simulation broker implementing the Korea Market v3 IBroker interface."""
+
     def __init__(
         self,
         initial_capital: float = 10_000_000.0,
@@ -38,6 +42,7 @@ class BacktestBroker(IBroker):
         self.tax_rate = tax_rate
         self.slippage_rate = slippage_rate
 
+        self._lock = threading.RLock()
         self.positions: Dict[str, Position] = {}
         self.pending_orders: Dict[str, Order] = {}
         self.latest_prices: Dict[str, float] = {}
@@ -47,125 +52,174 @@ class BacktestBroker(IBroker):
         self._trade_id_counter: int = 1
         self._event_listeners: List[Callable[[OrderEvent], None]] = []
 
+    # -------------------------------------------------------------------------
+    # Event Listeners
+    # -------------------------------------------------------------------------
     def register_event_listener(self, listener: Callable[[OrderEvent], None]) -> None:
-        self._event_listeners.append(listener)
+        """Registers a callback listener for OrderEvent broadcasts."""
+        with self._lock:
+            self._event_listeners.append(listener)
 
     def _emit_event(self, event: OrderEvent) -> None:
-        for listener in self._event_listeners:
+        """Dispatches event to listeners outside the lock."""
+        with self._lock:
+            listeners = list(self._event_listeners)
+
+        for listener in listeners:
             try:
                 listener(event)
             except Exception as e:
-                logger.error(f"Error in broker listener: {e}", exc_info=True)
+                logger.error(f"[BACKTEST] Error in broker listener: {e}", exc_info=True)
 
+    # -------------------------------------------------------------------------
+    # Position & Balance Queries
+    # -------------------------------------------------------------------------
     def get_position(self, symbol: str) -> Optional[Position]:
-        return self.positions.get(symbol)
+        """Returns position for symbol or None."""
+        with self._lock:
+            return self.positions.get(symbol)
 
     def get_positions(self) -> Dict[str, Position]:
-        return self.positions
+        """Returns positions dictionary."""
+        with self._lock:
+            return self.positions
 
     def get_balance(self) -> AccountBalance:
-        equity = self.cash + sum(p.current_price * p.quantity for p in self.positions.values())
-        return AccountBalance(total_equity=equity, cash=self.cash, positions=self.positions)
+        """Calculates dynamic equity snapshot based on current cash and position values."""
+        with self._lock:
+            equity = self.cash + sum(p.current_price * p.quantity for p in self.positions.values())
+            return AccountBalance(total_equity=equity, cash=self.cash, positions=dict(self.positions))
 
+    # -------------------------------------------------------------------------
+    # Price Feed Synchronization
+    # -------------------------------------------------------------------------
     def on_tick(self, tick: TickData) -> None:
-        self.latest_prices[tick.symbol] = tick.price
-        self.current_dt = tick.dt
-        if tick.symbol in self.positions:
-            pos = self.positions[tick.symbol]
-            pos.current_price = tick.price
-            if tick.price > pos.high_water_mark:
-                pos.high_water_mark = tick.price
-            if pos.low_water_mark == 0.0 or tick.price < pos.low_water_mark:
-                pos.low_water_mark = tick.price
+        """Updates symbol latest price, current datetime, and position watermarks."""
+        with self._lock:
+            self.latest_prices[tick.symbol] = tick.price
+            self.current_dt = tick.dt
+            if tick.symbol in self.positions:
+                pos = self.positions[tick.symbol]
+                pos.current_price = tick.price
+                if tick.price > pos.high_water_mark:
+                    pos.high_water_mark = tick.price
+                if pos.low_water_mark == 0.0 or tick.price < pos.low_water_mark:
+                    pos.low_water_mark = tick.price
 
     def on_bar(self, bar: MinuteBar) -> None:
-        self.latest_prices[bar.symbol] = bar.close
-        self.current_dt = bar.dt
-        if bar.symbol in self.positions:
-            pos = self.positions[bar.symbol]
-            pos.current_price = bar.close
-            if bar.high > pos.high_water_mark:
-                pos.high_water_mark = bar.high
-            if pos.low_water_mark == 0.0 or bar.low < pos.low_water_mark:
-                pos.low_water_mark = bar.low
+        """Updates symbol close price, current datetime, and position watermarks."""
+        with self._lock:
+            self.latest_prices[bar.symbol] = bar.close
+            self.current_dt = bar.dt
+            if bar.symbol in self.positions:
+                pos = self.positions[bar.symbol]
+                pos.current_price = bar.close
+                if bar.high > pos.high_water_mark:
+                    pos.high_water_mark = bar.high
+                if pos.low_water_mark == 0.0 or bar.low < pos.low_water_mark:
+                    pos.low_water_mark = bar.low
 
+    # -------------------------------------------------------------------------
+    # Order Execution & Microstructure Simulation
+    # -------------------------------------------------------------------------
     def submit_order(self, order: Order) -> str:
+        """
+        Simulates immediate bar/tick execution with KRX adverse slippage and fee deduction.
+        Enforces statutory tick rounding:
+          - BUY: ceil rounding (+slippage)
+          - SELL: floor rounding (-slippage)
+        """
         if not order.order_id:
             order.order_id = f"ord_{uuid.uuid4().hex[:8]}"
         if not order.created_at:
             order.created_at = self.current_dt or datetime.now()
 
-        # Immediate fill against known market / limit price
-        base_price = order.price or self.latest_prices.get(order.symbol, 0.0)
-        if base_price <= 0:
-            order.status = OrderStatus.REJECTED
-            self._emit_event(
-                OrderEvent(
-                    order_id=order.order_id,
-                    symbol=order.symbol,
-                    side=order.side,
-                    status=OrderStatus.REJECTED,
-                    filled_price=0.0,
-                    filled_quantity=0,
-                    dt=self.current_dt,
-                    message="REJECTED_ZERO_PRICE",
+        with self._lock:
+            base_price = order.price or self.latest_prices.get(order.symbol, 0.0)
+            if base_price <= 0:
+                order.status = OrderStatus.REJECTED
+                self._emit_event(
+                    OrderEvent(
+                        order_id=order.order_id,
+                        symbol=order.symbol,
+                        side=order.side,
+                        status=OrderStatus.REJECTED,
+                        filled_price=0.0,
+                        filled_quantity=0,
+                        dt=self.current_dt,
+                        message="REJECTED_ZERO_PRICE",
+                    )
                 )
-            )
-            return order.order_id
+                return order.order_id
 
-        # Apply slippage & round to KRX tick (adverse rounding: BUY ceil, SELL floor)
-        if order.side == OrderSide.BUY:
-            raw_exec = base_price * (1.0 + self.slippage_rate)
-            exec_price = round_to_krx_tick(raw_exec, side="BUY", round_mode="ceil")
-        else:
-            raw_exec = base_price * (1.0 - self.slippage_rate)
-            exec_price = round_to_krx_tick(raw_exec, side="SELL", round_mode="floor")
+            # Apply adverse slippage & round to KRX tick (BUY ceil, SELL floor)
+            if order.side == OrderSide.BUY:
+                raw_exec = base_price * (1.0 + self.slippage_rate)
+                exec_price = round_to_krx_tick(raw_exec, side="BUY", round_mode="ceil")
+            else:
+                raw_exec = base_price * (1.0 - self.slippage_rate)
+                exec_price = round_to_krx_tick(raw_exec, side="SELL", round_mode="floor")
 
-        trade_amount = exec_price * order.quantity
-        commission = trade_amount * self.commission_rate
-        tax = trade_amount * self.tax_rate if order.side == OrderSide.SELL else 0.0
-        total_cost = trade_amount + commission + tax
+            trade_amount = exec_price * order.quantity
+            commission = trade_amount * self.commission_rate
+            tax = trade_amount * self.tax_rate if order.side == OrderSide.SELL else 0.0
+            total_cost = trade_amount + commission + tax
 
-        # Insufficient cash check
-        if order.side == OrderSide.BUY and self.cash < total_cost:
-            order.status = OrderStatus.REJECTED
-            self._emit_event(
-                OrderEvent(
-                    order_id=order.order_id,
-                    symbol=order.symbol,
-                    side=order.side,
-                    status=OrderStatus.REJECTED,
-                    filled_price=0.0,
-                    filled_quantity=0,
-                    dt=self.current_dt,
-                    message="REJECTED_INSUFFICIENT_FUNDS",
+            # Insufficient cash guard
+            if order.side == OrderSide.BUY and self.cash < total_cost:
+                order.status = OrderStatus.REJECTED
+                self._emit_event(
+                    OrderEvent(
+                        order_id=order.order_id,
+                        symbol=order.symbol,
+                        side=order.side,
+                        status=OrderStatus.REJECTED,
+                        filled_price=0.0,
+                        filled_quantity=0,
+                        dt=self.current_dt,
+                        message="REJECTED_INSUFFICIENT_FUNDS",
+                    )
                 )
-            )
-            return order.order_id
+                return order.order_id
 
-        self._fill_order(order, exec_price)
-        return order.order_id
+            self._fill_order(order, exec_price)
+            return order.order_id
 
     def cancel_order(self, order_id: str) -> bool:
-        if order_id in self.pending_orders:
-            ord_ = self.pending_orders.pop(order_id)
-            ord_.status = OrderStatus.CANCELLED
-            self._emit_event(
-                OrderEvent(
-                    order_id=ord_.order_id,
-                    symbol=ord_.symbol,
-                    side=ord_.side,
-                    status=OrderStatus.CANCELLED,
-                    filled_price=0.0,
-                    filled_quantity=0,
-                    dt=self.current_dt,
-                    message="CANCELLED",
+        """Cancels an order from pending orders."""
+        with self._lock:
+            if order_id in self.pending_orders:
+                ord_ = self.pending_orders.pop(order_id)
+                ord_.status = OrderStatus.CANCELLED
+                self._emit_event(
+                    OrderEvent(
+                        order_id=ord_.order_id,
+                        symbol=ord_.symbol,
+                        side=ord_.side,
+                        status=OrderStatus.CANCELLED,
+                        filled_price=0.0,
+                        filled_quantity=0,
+                        dt=self.current_dt,
+                        message="CANCELLED",
+                    )
                 )
-            )
-            return True
+                return True
         return False
 
+    def cancel_pending_orders(self, symbol: Optional[str] = None) -> List[str]:
+        """Cancels all active pending orders, optionally filtered by symbol."""
+        with self._lock:
+            pending_list = list(self.pending_orders.items())
+
+        cancelled_ids: List[str] = []
+        for ord_id, ord_ in pending_list:
+            if symbol is None or ord_.symbol == symbol:
+                if self.cancel_order(ord_id):
+                    cancelled_ids.append(ord_id)
+        return cancelled_ids
+
     def _fill_order(self, order: Order, fill_price: float) -> None:
+        """Internal order fill logic updating cash, positions, and recording completed trades."""
         trade_amount = fill_price * order.quantity
         commission = trade_amount * self.commission_rate
         tax = trade_amount * self.tax_rate if order.side == OrderSide.SELL else 0.0
@@ -199,9 +253,11 @@ class BacktestBroker(IBroker):
             # SELL / LIQUIDATION
             self.cash += (trade_amount - commission - tax)
             if order.symbol in self.positions:
-                pos = self.positions.pop(order.symbol)
-                gross_pnl = (fill_price - pos.avg_price) * pos.quantity
-                net_pnl = gross_pnl - commission - tax - (pos.avg_price * pos.quantity * self.commission_rate)
+                pos = self.positions[order.symbol]
+                sell_qty = min(order.quantity, pos.quantity)
+                gross_pnl = (fill_price - pos.avg_price) * sell_qty
+                entry_comm = pos.avg_price * sell_qty * self.commission_rate
+                net_pnl = gross_pnl - commission - tax - entry_comm
                 ret_pct = (fill_price - pos.avg_price) / pos.avg_price if pos.avg_price > 0 else 0.0
                 holding_sec = (self.current_dt - pos.entry_dt).total_seconds() if self.current_dt and pos.entry_dt else 0.0
 
@@ -212,7 +268,7 @@ class BacktestBroker(IBroker):
                     exit_dt=self.current_dt,
                     entry_price=pos.avg_price,
                     exit_price=fill_price,
-                    quantity=pos.quantity,
+                    quantity=sell_qty,
                     side="BUY",
                     gross_pnl=gross_pnl,
                     net_pnl=net_pnl,
@@ -224,6 +280,10 @@ class BacktestBroker(IBroker):
                 )
                 self.completed_trades.append(record)
                 self._trade_id_counter += 1
+
+                pos.quantity -= sell_qty
+                if pos.quantity <= 0:
+                    self.positions.pop(order.symbol, None)
 
         event = OrderEvent(
             order_id=order.order_id,
@@ -239,4 +299,3 @@ class BacktestBroker(IBroker):
             message="FILLED",
         )
         self._emit_event(event)
-

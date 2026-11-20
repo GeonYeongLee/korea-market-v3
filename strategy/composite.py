@@ -1,5 +1,6 @@
 """
 Composite Strategy Orchestrator.
+=================================
 Assembles 3 decoupled components (Scanner, EntryRule, ExitPolicy) into a unified trading strategy.
 Completely replaces monolithic strategy files with clean, testable Lego blocks.
 """
@@ -7,13 +8,13 @@ from __future__ import annotations
 
 import logging
 from datetime import date, time
-from typing import Optional, List, Dict, Set, Any
+from typing import Any, Dict, Optional, Set
 
+from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_feature_provider
 from core.krx_ticks import get_krx_tick_size
 from core.market_regime import MarketRegimeProvider, get_default_market_regime_provider
-from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_feature_provider
-from engine.models import MinuteBar, TickData, OrderEvent, OrderStatus, OrderSide, Position
-from strategy.base import BaseStrategy, IScanner, IEntryRule, IExitPolicy
+from engine.models import MinuteBar, OrderEvent, OrderSide, OrderStatus, Position, TickData
+from strategy.base import BaseStrategy, IEntryRule, IExitPolicy, IScanner
 
 logger = logging.getLogger("korea_market.strategy.composite")
 
@@ -21,9 +22,9 @@ logger = logging.getLogger("korea_market.strategy.composite")
 class CompositeStrategy(BaseStrategy):
     """
     Modular trading strategy composed of:
-      1. scanner : Universe screening & discovery
-      2. entry   : Signal trigger & Collar-cap pricing
-      3. exit    : Stop-loss, trailing, and liquidation policies
+      1. scanner     : Universe screening & discovery
+      2. entry       : Signal trigger & Collar-cap pricing
+      3. exit_policy : Stop-loss, trailing, and liquidation policies
     """
 
     def __init__(
@@ -46,7 +47,30 @@ class CompositeStrategy(BaseStrategy):
         regime_provider: Optional[MarketRegimeProvider] = None,
         dynamic_feature_provider: Optional[DynamicFeatureProvider] = None,
         name: str = "composite_strategy",
-    ):
+    ) -> None:
+        """
+        Initializes CompositeStrategy with decoupled modules and regime options.
+
+        Args:
+            scanner: IScanner instance for candidate discovery.
+            entry: IEntryRule instance for order signal evaluation.
+            exit_policy: IExitPolicy instance for trade lifecycle and liquidation.
+            max_daily_positions: Maximum number of concurrent positions allowed per day.
+            total_capital: Total portfolio trading capital.
+            dynamic_slots: Whether to dynamically adjust slot count based on index gap.
+            base_slots: Base slot allocation under normal regime.
+            expanded_slots: Expanded slot allocation under high-conviction regime.
+            kospi_gap_threshold: Threshold to switch between base and expanded slots.
+            max_market_gap: Upper market gap ceiling filter (None to disable).
+            severe_gap_down_filter: Severe gap-down halt threshold.
+            use_dual_index: Whether to use 4-quadrant dual-index regime classification.
+            gap_filter_index: Index to evaluate for gap filtering ('max', 'kospi', 'kosdaq').
+            dynamic_max_gap: Whether to use dynamic ATR-based gap ceiling.
+            bear_market_defense: Whether to halt trading if both KOSPI and KOSDAQ are below MA20.
+            regime_provider: Optional MarketRegimeProvider override.
+            dynamic_feature_provider: Optional DynamicFeatureProvider override.
+            name: Identifier name for the composite strategy instance.
+        """
         self.scanner = scanner
         self.entry = entry
         self.exit_policy = exit_policy
@@ -66,8 +90,12 @@ class CompositeStrategy(BaseStrategy):
         self.regime_provider = regime_provider
         self.dynamic_feature_provider = dynamic_feature_provider
         self.name = name
+        self.single_slot_cap_pct: Optional[float] = None
+        self.effective_capital: float = total_capital
 
-        self.current_slot_notional: float = (total_capital / max(1, max_daily_positions)) if max_daily_positions > 0 else 0.0
+        self.current_slot_notional: float = (
+            (total_capital / max(1, max_daily_positions)) if max_daily_positions > 0 else 0.0
+        )
         self._active_candidates: Set[str] = set()
         self._daily_trade_count: int = 0
         self._pending_ref_bars: Dict[str, Dict[str, Any]] = {}
@@ -87,20 +115,28 @@ class CompositeStrategy(BaseStrategy):
         return time(latest.hour + m // 60, m % 60)
 
     def on_start(self, context: Any) -> None:
+        """Lifecycle hook invoked once when trading engine initializes."""
         logger.info(
             f"🚀 [{self.name} Started] Scanner: {self.scanner.name} | "
             f"Entry: {self.entry.name} | Exit: {self.exit_policy.name}"
         )
 
     def on_stop(self, context: Any) -> None:
+        """Lifecycle hook invoked when trading engine terminates."""
         logger.info(f"🛑 [{self.name} Stopped]")
 
     def _set_regime(self, slots: int, desc: str) -> None:
+        """Applies regime slot allocation and updates per-slot notional amount."""
         self.max_daily_positions = max(0, slots)
         effective = getattr(self, "effective_capital", self.total_capital)
-        self.current_slot_notional = (effective / max(1, self.max_daily_positions)) if self.max_daily_positions > 0 else 0.0
+        self.current_slot_notional = (
+            (effective / max(1, self.max_daily_positions)) if self.max_daily_positions > 0 else 0.0
+        )
         suffix = f" ({self.current_slot_notional:,.0f} KRW/slot)" if self.max_daily_positions > 0 else ""
-        logger.info(f"🧭 [{self.name}] Daily Regime Configured: {desc} -> {self.max_daily_positions} slot{'s' if self.max_daily_positions != 1 else ''}{suffix}")
+        logger.info(
+            f"🧭 [{self.name}] Daily Regime Configured: {desc} -> "
+            f"{self.max_daily_positions} slot{'s' if self.max_daily_positions != 1 else ''}{suffix}"
+        )
 
     def sync_capital_with_balance(self, available_cash: float) -> None:
         """Dynamically caps trading capital to actual available cash (buffer 0.5%) if under total_capital."""
@@ -116,10 +152,12 @@ class CompositeStrategy(BaseStrategy):
                     self.entry.target_notional = self.current_slot_notional
                 logger.info(
                     f"💰 [{self.name}] Capital Synchronized: Available {available_cash:,.0f} KRW "
-                    f"-> Effective {self.effective_capital:,.0f} KRW ({self.current_slot_notional:,.0f} KRW/slot, {self.max_daily_positions} slots)"
+                    f"-> Effective {self.effective_capital:,.0f} KRW "
+                    f"({self.current_slot_notional:,.0f} KRW/slot, {self.max_daily_positions} slots)"
                 )
 
     def _configure_regime(self, current_date: date) -> None:
+        """Evaluates market index gaps, ATR, and MA20 trend to configure daily trade capacity."""
         provider = self.regime_provider or get_default_market_regime_provider()
         dyn_provider = self.dynamic_feature_provider or get_default_dynamic_feature_provider()
         ks_gap = provider.get_kospi_gap(current_date) if hasattr(provider, "get_kospi_gap") else None
@@ -128,7 +166,10 @@ class CompositeStrategy(BaseStrategy):
 
         # 1. Bear Market Defense: If both KOSPI and KOSDAQ are below MA20 on t-1 -> 0 slots
         if self.bear_market_defense and idx_feat.is_bear_market:
-            return self._set_regime(0, f"Dual-Index Bear Market Defense (KS MA20 {idx_feat.ks_trend:+.2%}, KQ MA20 {idx_feat.kq_trend:+.2%})")
+            return self._set_regime(
+                0,
+                f"Dual-Index Bear Market Defense (KS MA20 {idx_feat.ks_trend:+.2%}, KQ MA20 {idx_feat.kq_trend:+.2%})",
+            )
 
         # 2. Gap-Up Trap Filter
         eff_gap = kq_gap if self.gap_filter_index == "kosdaq" else (
@@ -140,6 +181,12 @@ class CompositeStrategy(BaseStrategy):
             return self._set_regime(0, f"{gt} Gap-Up Trap Filter ({eff_gap:+.2f}% > {max_gap:+.2f}%)")
 
         if not self.dynamic_slots:
+            cands = getattr(self.scanner, "_day_candidates", None)
+            k = len(cands) if cands is not None else self.base_max_daily_positions
+            if k == 1 and self.single_slot_cap_pct is not None:
+                self.max_daily_positions = 1
+                self.current_slot_notional = self.effective_capital * self.single_slot_cap_pct
+                return
             return self._set_regime(self.base_max_daily_positions, "Static Slots")
 
         # 3. Dynamic Slots Allocation
@@ -167,32 +214,43 @@ class CompositeStrategy(BaseStrategy):
         self._set_regime(slots, f"KOSPI Gap {gap_val:+.2f}% {op} {self.kospi_gap_threshold:.1f}%")
 
     def on_day_open(self, context: Any, current_date: date) -> None:
+        """Daily session opening lifecycle hook. Clears tracking caches and configures regime."""
         self._active_candidates.clear()
         self._daily_trade_count = 0
         self._pending_ref_bars.clear()
 
-        # Synchronize capital with actual cash if available from context
+        # Synchronize effective capital with account equity
         bal = context.get_balance() if hasattr(context, "get_balance") else None
-        if bal and bal.cash > 0:
-            if bal.cash < self.total_capital:
-                self.effective_capital = bal.cash * 0.995
+        if bal and bal.total_equity > 0:
+            if bal.total_equity < self.total_capital:
+                self.effective_capital = bal.total_equity * 0.995
             else:
                 self.effective_capital = self.total_capital
         else:
             self.effective_capital = getattr(self, "effective_capital", self.total_capital)
 
+        if self.max_daily_positions > 0:
+            self.current_slot_notional = self.effective_capital / self.max_daily_positions
+
+        self.scanner.on_day_open(current_date)
         self._configure_regime(current_date)
 
         if hasattr(self.entry, "target_notional"):
             self.entry.target_notional = self.current_slot_notional
-        self.scanner.on_day_open(current_date)
         self.entry.on_day_open(current_date)
         self.exit_policy.on_day_open(current_date)
 
     def on_day_close(self, context: Any, current_date: date) -> None:
+        """Daily session closing lifecycle hook."""
         pass
 
     def on_bar(self, context: Any, bar: MinuteBar) -> None:
+        """
+        Processes new 1-minute bar:
+          1. Evaluates active position exit conditions first.
+          2. Screens universe candidates via scanner.
+          3. Evaluates entry signals, performs cash sizing, and submits orders.
+        """
         # Step 1: Manage Active Positions via Exit Policy
         position: Optional[Position] = context.get_position(bar.symbol)
         if position and position.quantity > 0:
@@ -200,7 +258,12 @@ class CompositeStrategy(BaseStrategy):
             if exit_signal:
                 has_target = exit_signal.target_price is not None and exit_signal.target_price > 0
                 is_sl = "SL" in exit_signal.reason or "STOP" in exit_signal.reason
-                exec_price = min(bar.open, exit_signal.target_price) if (is_sl and has_target) else bar.close
+                if is_sl and has_target:
+                    exec_price = min(bar.open, exit_signal.target_price)
+                elif has_target:
+                    exec_price = exit_signal.target_price
+                else:
+                    exec_price = bar.close
                 tgt_str = f"{exit_signal.target_price:,.0f}" if has_target else "N/A"
                 logger.info(
                     f"🔻 [EXIT SIGNAL] {bar.symbol} Reason: {exit_signal.reason} | "
@@ -245,16 +308,26 @@ class CompositeStrategy(BaseStrategy):
                     prior_atr = entry_signal.metadata.get("prior_atr20_pct")
                     anchor_info = entry_signal.metadata.get("anchor_info")
                     ref_bar = {
-                        "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close,
-                        "dt": bar.dt, "turnover": bar.turnover, "volume": bar.volume,
+                        "open": bar.open,
+                        "high": bar.high,
+                        "low": bar.low,
+                        "close": bar.close,
+                        "dt": bar.dt,
+                        "turnover": bar.turnover,
+                        "volume": bar.volume,
                         "prior_atr20_pct": prior_atr,
                         "anchor_info": anchor_info,
                     }
                     self._pending_ref_bars[bar.symbol] = ref_bar
-                    order_id = context.buy(
-                        symbol=bar.symbol, quantity=qty, price=entry_signal.collar_cap_price, tag=entry_signal.reason
+                    buy_price = (
+                        entry_signal.trigger_price
+                        if (entry_signal.trigger_price and entry_signal.trigger_price > 0)
+                        else entry_signal.collar_cap_price
                     )
-                    if order_id is not None:
+                    order_id = context.buy(
+                        symbol=bar.symbol, quantity=qty, price=buy_price, tag=entry_signal.reason
+                    )
+                    if order_id and len(order_id) > 0:
                         self._daily_trade_count += 1
                         self._active_candidates.discard(bar.symbol)
                         pos = context.get_position(bar.symbol)
@@ -266,8 +339,11 @@ class CompositeStrategy(BaseStrategy):
                                 pos.metadata.setdefault("prior_atr20_pct", prior_atr)
                     else:
                         self._pending_ref_bars.pop(bar.symbol, None)
+                        if hasattr(self.entry, "rollback_entered_symbol"):
+                            self.entry.rollback_entered_symbol(bar.symbol)
 
     def on_tick(self, context: Any, tick: TickData) -> None:
+        """Processes real-time WebSocket tick for ultra-low latency position exit evaluation."""
         position: Optional[Position] = context.get_position(tick.symbol)
         if position and position.quantity > 0:
             exit_signal = self.exit_policy.evaluate_exit(position, None, tick=tick)
@@ -275,6 +351,7 @@ class CompositeStrategy(BaseStrategy):
                 context.liquidate(tick.symbol, price=tick.price, tag=exit_signal.reason)
 
     def on_order_event(self, context: Any, event: OrderEvent) -> None:
+        """Handles order execution, fill, rejection, and cancellation callbacks."""
         if event.side == OrderSide.BUY:
             if event.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
                 if event.filled_quantity == 0:

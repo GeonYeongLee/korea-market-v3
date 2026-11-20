@@ -42,7 +42,7 @@ from engine.clock import RealtimeClock
 from engine.datafeed.kis_live import KisRealtimeFeed
 from engine.risk.risk_manager import RiskManager
 from engine.engine import TradingEngine
-from data_pipeline.realtime_scanner import RealtimeLeaderScanner
+from data_pipeline.realtime_scanner import RealtimeLeaderScanner, RealtimeAnchorScanner
 from strategy.registry import build_strategy
 
 logger = logging.getLogger("kis.engine.daily_routine")
@@ -77,7 +77,16 @@ class DailyRoutineOrchestrator:
             dynamic=True,
         )
 
-    def run(self, wait_for_market_open: bool = True) -> None:
+    @property
+    def is_overnight_strategy(self) -> bool:
+        """Determines if the active strategy holds positions overnight across market close."""
+        return (
+            self.scanner_name in ("champion_b", "anchor_body_micro", "anchor_close", "crisis_rebound")
+            or "anchor" in getattr(self.strategy, "name", "").lower()
+            or "crisis" in getattr(self.strategy, "name", "").lower()
+        )
+
+    def run(self, wait_for_market_open: bool = True, single_cycle: bool = False) -> None:
         """Executes the complete 4-stage daily trading routine."""
         date_iso = (
             f"{self.target_date[:4]}-{self.target_date[4:6]}-{self.target_date[6:]}"
@@ -124,8 +133,34 @@ class DailyRoutineOrchestrator:
         except Exception as e:
             logger.debug(f"Could not pre-load KRX symbol map: {e}")
 
+        is_overnight_strat = self.scanner_name in ("champion_b", "anchor_body_micro", "anchor_close") or "anchor" in getattr(self.strategy, "name", "").lower()
         now = datetime.now()
         market_open_time = dtime(9, 0, 0)
+        auction_order_time = dtime(8, 50, 0)
+
+        # For overnight strategies, participate in the 08:30~09:00 Call Auction at 08:50:00 to achieve exact 09:00 open price (0% slippage)
+        if is_overnight_strat and now.time() < market_open_time:
+            open_pos = stage1_broker.get_positions()
+            if open_pos:
+                if now.time() < auction_order_time:
+                    wait_sec = (datetime.combine(now.date(), auction_order_time) - now).total_seconds()
+                    console.print(f"[yellow]⏳ [STAGE 1.5] 08:50 장개시전 동시호가 청산 접수까지 대기합니다 ({wait_sec:.0f}초)...[/yellow]")
+                    time.sleep(max(0, wait_sec))
+
+                console.print(f"[bold yellow]📢 [STAGE 1.5] 08:50 KRX 장개시전 동시호가(08:30~09:00) 시장가 청산 주문 전송[/bold yellow]")
+                from engine.models import Order, OrderSide, OrderType
+                for sym, p in list(open_pos.items()):
+                    console.print(f"   ➜ 동시호가 매도 발주: {sym} x {p.quantity}주 (09:00 시초가 단일가 무슬리피지 0.0% 체결)")
+                    stage1_broker.submit_order(Order(
+                        order_id=f"OPEN_AUCTION_{sym}_{int(time.time())}",
+                        symbol=sym,
+                        side=OrderSide.SELL,
+                        order_type=OrderType.MARKET,
+                        quantity=p.quantity,
+                        price=0.0,
+                        tag="KRX_0900_OPEN_AUCTION",
+                    ))
+
         if wait_for_market_open and now.time() < market_open_time:
             sec_to_wait = (datetime.combine(now.date(), market_open_time) - now).total_seconds()
             if sec_to_wait > 0:
@@ -137,7 +172,7 @@ class DailyRoutineOrchestrator:
         # =====================================================================
         should_skip_trading = False
         now = datetime.now()
-        if now.time() >= cutoff_t:
+        if not is_overnight_strat and now.time() >= cutoff_t:
             env_mode = "vts" if self.mode == "mock" else "real"
             cfg = settings.switch_env(env_mode)
             check_broker = KisLiveBroker(mode=env_mode, cfg=cfg)
@@ -185,15 +220,30 @@ class DailyRoutineOrchestrator:
                 clock=clock,
                 risk_manager=risk_manager,
             )
-            scanner = RealtimeLeaderScanner(
-                client=broker.client,
-                datafeed=datafeed,
-                strategy=self.strategy,
-                context=engine.context,
-            )
+            if is_overnight_strat:
+                from data_pipeline.realtime_scanner import RealtimeAnchorScanner
+                scanner = RealtimeAnchorScanner(
+                    client=broker.client,
+                    datafeed=datafeed,
+                    strategy=self.strategy,
+                    context=engine.context,
+                )
+            else:
+                scanner = RealtimeLeaderScanner(
+                    client=broker.client,
+                    datafeed=datafeed,
+                    strategy=self.strategy,
+                    context=engine.context,
+                )
 
             try:
                 broker.sync_account_state()
+                # Proactively subscribe all held positions to WebSocket feed
+                held_positions = broker.get_positions()
+                for sym in held_positions.keys():
+                    logger.info(f"Subscribing existing holding to live feed: {sym}")
+                    datafeed.subscribe_symbol(sym)
+
                 bal = broker.get_balance()
                 if bal and bal.cash > 0 and hasattr(self.strategy, "sync_capital_with_balance"):
                     self.strategy.sync_capital_with_balance(bal.cash)
@@ -207,11 +257,13 @@ class DailyRoutineOrchestrator:
 
                 eod_liquidated_symbols = set()
                 while True:
+                    if single_cycle:
+                        break
                     time.sleep(1.0)
                     curr_t = datetime.now().time()
 
-                    # 15:20 KRX 장마감 동시호가 전량 청산 (오버나잇 0% 불변량)
-                    if curr_t >= dtime(15, 20, 0):
+                    # 15:20 KRX 장마감 동시호가 전량 청산 (데이트레이딩 전용, 오버나잇 전략은 청산 제외!)
+                    if not is_overnight_strat and curr_t >= dtime(15, 20, 0):
                         open_pos = broker.get_positions()
                         if open_pos:
                             for sym, p in list(open_pos.items()):
@@ -240,7 +292,14 @@ class DailyRoutineOrchestrator:
                         )
                         break
 
-                    if curr_t > cutoff_t and not open_pos:
+                    # Overnight close-betting clean exit after 15:30:10 call auction completion
+                    if is_overnight_strat and curr_t >= dtime(15, 30, 10):
+                        console.print(
+                            f"\n[bold green]🛑 [STAGE 4] 15:30 KRX 장마감 동시호가 체결 완료: 오버나잇 잔고 확인 후 세션을 정상 종료합니다.[/bold green]"
+                        )
+                        break
+
+                    if not is_overnight_strat and curr_t > cutoff_t and not open_pos:
                         console.print(
                             f"\n[bold yellow]🛑 [STAGE 4] 골든 윈도우 마감 ({cutoff_str}) 및 보유 잔고 0: 당일 매매 세션을 종료합니다.[/bold yellow]"
                         )

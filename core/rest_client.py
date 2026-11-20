@@ -360,7 +360,22 @@ class KISRestClient:
         resp = self._send_request("GET", url, headers=headers, params=params, timeout=5)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("output", {})
+        return data.get("output") or {}
+
+    def get_index_price(self, iscd: str = "1001", market_div: str = "U") -> Dict[str, Any]:
+        """국내업종 현재지수 조회 (TR: FHPUP02100000). 코스닥 1001, 코스피 0001 등 실시간 등락률 조회."""
+        self.limiter.acquire_sync()
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-index-price"
+        tr_id = "FHPUP02100000"
+        headers = self._get_headers(tr_id)
+        params = {
+            "FID_COND_MRKT_DIV_CODE": market_div,
+            "FID_INPUT_ISCD": iscd,
+        }
+        resp = self._send_request("GET", url, headers=headers, params=params, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("output") or {}
 
     def get_today_minute_bars(
         self,

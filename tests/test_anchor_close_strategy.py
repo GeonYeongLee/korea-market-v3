@@ -116,3 +116,84 @@ def test_anchor_close_universal_strategy_audit_14_contracts():
     assert report.total_checks == 14
     assert report.passed_checks == 14
     assert report.passed is True
+
+
+def test_anchor_conditional_morning_exit_nxt_and_open():
+    """
+    Verifies AnchorConditionalMorningExit:
+      1. 08:00~08:50 NXT early take profit if surge >= +3.0%
+      2. 08:00~08:50 NXT no-loss-cut rule (holds through dip to avoid undershooting shakeout)
+      3. 09:00 KRX Open Liquidation
+    """
+    exit_policy = AnchorMorningExit(
+        exit_at_open=True,
+        enable_nxt_exit=True,
+        nxt_tp_pct=0.030,
+        nxt_start_time=time(8, 0),
+        nxt_end_time=time(8, 50),
+        open_exit_time=time(9, 0),
+        hard_timeout=time(15, 20),
+    )
+
+    pos = Position(
+        symbol="005930",
+        quantity=100,
+        avg_price=50000.0,
+        current_price=50000.0,
+        high_water_mark=50000.0,
+        entry_dt=datetime(2025, 1, 13, 15, 20),
+        phase=1,
+        metadata={"ref_bar": {"open": 50000.0, "high": 50500.0, "low": 49800.0, "close": 50000.0}},
+    )
+    exit_policy.on_position_opened(pos)
+
+    # 1. NXT Pre-market (08:15) with +4.0% surge -> triggers early TP
+    bar_nxt_surge = MinuteBar("005930", datetime(2025, 1, 14, 8, 15), 51500.0, 52000.0, 51400.0, 51800.0, 500)
+    sig_nxt = exit_policy.evaluate_exit(pos, bar_nxt_surge)
+    assert sig_nxt is not None
+    assert sig_nxt.reason == "NXT_0800_EARLY_TAKE_PROFIT"
+    assert sig_nxt.target_price == 51500.0 # +3.0% locked price
+
+    # 2. NXT Pre-market (08:20) with -2.0% dip -> NO exit (no loss cut at 08:00)
+    pos_dip = Position(
+        symbol="005930",
+        quantity=100,
+        avg_price=50000.0,
+        current_price=50000.0,
+        high_water_mark=50000.0,
+        entry_dt=datetime(2025, 1, 13, 15, 20),
+        phase=1,
+        metadata={"ref_bar": {"open": 50000.0, "high": 50500.0, "low": 49800.0, "close": 50000.0}},
+    )
+    exit_policy.on_position_opened(pos_dip)
+    bar_nxt_dip = MinuteBar("005930", datetime(2025, 1, 14, 8, 20), 49000.0, 49200.0, 48800.0, 49000.0, 1000)
+    sig_dip = exit_policy.evaluate_exit(pos_dip, bar_nxt_dip)
+    assert sig_dip is None # Must hold to 09:00 auction
+
+    # 3. KRX Regular Open (09:00) -> triggers open liquidation
+    bar_open = MinuteBar("005930", datetime(2025, 1, 14, 9, 0), 49500.0, 49800.0, 49300.0, 49700.0, 15000)
+    sig_open = exit_policy.evaluate_exit(pos_dip, bar_open)
+    assert sig_open is not None
+    assert sig_open.reason == "KRX_0900_OPEN_EXIT"
+    assert sig_open.target_price == 49500.0 # Filled at open price
+
+
+def test_anchor_conditional_5_slots_universal_strategy_audit():
+    """Verifies that 5-slot CompositeStrategy with conditional 08:00 exit passes all 14 universal audit contracts."""
+    strategy = build_strategy(
+        scanner_name="anchor_close",
+        entry_name="anchor_close",
+        exit_name="anchor_conditional_0800",
+        max_daily_positions=5,
+        total_capital=10_000_000.0,
+        ambiguity_mode="pessimistic",
+    )
+    assert strategy.max_daily_positions == 5
+    assert strategy.current_slot_notional == 2_000_000.0 # 10M / 5 slots = 2M per slot
+
+    auditor = UniversalStrategyAuditor()
+    report = auditor.audit(strategy)
+
+    assert report.total_checks == 14
+    assert report.passed_checks == 14
+    assert report.passed is True

@@ -18,17 +18,20 @@ logger = logging.getLogger("korea_market.datafeed.historical")
 
 
 class HistoricalDataFeed(IDataFeed):
+
     def __init__(
         self,
         data_dir: str = "data/dataset_2y/daily",
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         symbols: Optional[List[str]] = None,
+        pool_file: Optional[str] = "research/round2_candidate_pool.parquet",
     ):
         self.data_dir = data_dir
         self.start_date = start_date
         self.end_date = end_date
         self.symbols = set(symbols) if symbols else None
+        self.pool_file = pool_file
         self.filter_provider: Optional[Callable[[datetime], Tuple[bool, Optional[Set[str]]]]] = None
 
     def register_filter(
@@ -38,8 +41,82 @@ class HistoricalDataFeed(IDataFeed):
         """Registers a coordinated event stream filter callback."""
         self.filter_provider = provider
 
+    def _resolve_pool_file(self) -> Optional[str]:
+        if not self.pool_file:
+            return None
+        if os.path.exists(self.pool_file):
+            return self.pool_file
+        alt_paths = [
+            os.path.join("..", self.pool_file),
+            os.path.join("..", "korea-market_v3-anchor", self.pool_file),
+        ]
+        for p in alt_paths:
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _stream_from_pool(self, resolved_pool_path: str) -> Iterator[MinuteBar]:
+        df = pd.read_parquet(resolved_pool_path)
+        df["date_str"] = pd.to_datetime(df["date_str"]).dt.strftime("%Y-%m-%d")
+        df["symbol"] = df["symbol"].astype(str).str.zfill(6)
+
+        start_s = self.start_date if self.start_date else "1980-01-01"
+        end_s = self.end_date if self.end_date else "2099-12-31"
+        if len(start_s) == 8 and start_s.isdigit():
+            start_s = f"{start_s[:4]}-{start_s[4:6]}-{start_s[6:]}"
+        if len(end_s) == 8 and end_s.isdigit():
+            end_s = f"{end_s[:4]}-{end_s[4:6]}-{end_s[6:]}"
+
+        df = df[(df["date_str"] >= start_s) & (df["date_str"] <= end_s)]
+
+        events = []
+        for _, r in df.iterrows():
+            d_str = r["date_str"]
+            dt_entry = datetime.strptime(d_str, "%Y-%m-%d").replace(hour=15, minute=20)
+            b_entry = MinuteBar(
+                symbol=r["symbol"],
+                dt=dt_entry,
+                open=float(r["close"]),
+                high=float(r["high"]),
+                low=float(r["low"]),
+                close=float(r["close"]),
+                volume=int(r.get("volume", 100000)),
+                turnover=float(r["turnover"]),
+                cum_turnover=float(r["turnover"]),
+            )
+            events.append((dt_entry, 1, b_entry))
+
+            if pd.notna(r.get("next_date_str")):
+                nd_str = str(r["next_date_str"])[:10]
+                dt_exit = datetime.strptime(nd_str, "%Y-%m-%d").replace(hour=9, minute=0)
+                n_open = float(r["next_open"])
+                b_exit = MinuteBar(
+                    symbol=r["symbol"],
+                    dt=dt_exit,
+                    open=n_open,
+                    high=float(r.get("next_high", n_open)),
+                    low=float(r.get("next_low", n_open)),
+                    close=float(r.get("next_close", n_open)),
+                    volume=int(r.get("next_volume", 100000)),
+                    turnover=float(r["turnover"]),
+                    cum_turnover=float(r["turnover"]),
+                )
+                events.append((dt_exit, 0, b_exit))
+
+        events.sort(key=lambda x: (x[0], x[1], x[2].symbol))
+        for _, _, b in events:
+            yield b
+
     def stream_events(self) -> Iterator[Union[MinuteBar, TickData]]:
-        if not os.path.exists(self.data_dir):
+        resolved_pool = self._resolve_pool_file()
+        start_s = self.start_date.replace("-", "") if self.start_date else ""
+
+        # If backtest starts prior to local partitioned 1-minute dataset (20241021) or data_dir doesn't exist,
+        # stream seamlessly from multi-year candidate pool.
+        if (start_s and start_s < "20241021") or not os.path.exists(self.data_dir):
+            if resolved_pool:
+                yield from self._stream_from_pool(resolved_pool)
+                return
             logger.warning(f"Data directory does not exist: {self.data_dir}")
             return
 
@@ -181,9 +258,14 @@ class HistoricalDataFeed(IDataFeed):
             if self.filter_provider is not None:
                 last_dt = state.get("last_dt") or cutoff_dt
                 is_done, active_syms = self.filter_provider(last_dt)
-                if is_done or not active_syms:
+                if is_done or (active_syms is not None and len(active_syms) == 0):
                     return
-                filter_pm = (ds.field("timestamp") > cutoff_scalar) & ds.field("symbol").isin(list(active_syms))
+                if active_syms is not None:
+                    filter_pm = (ds.field("timestamp") > cutoff_scalar) & ds.field("symbol").isin(list(active_syms))
+                else:
+                    filter_pm = ds.field("timestamp") > cutoff_scalar
+                    if self.symbols:
+                        filter_pm = filter_pm & ds.field("symbol").isin(list(self.symbols))
             else:
                 filter_pm = ds.field("timestamp") > cutoff_scalar
                 if self.symbols:

@@ -158,6 +158,17 @@ class Settings(BaseModel):
     rest_max_requests_per_sec: float = 18.0  # Under 20 req/s KIS hard limit
     log_level: str = Field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
+    # Crisis Rebound Engine Settings (Golden Parameters: Pattern C & Pattern A Fallback)
+    crisis_rebound_enabled: bool = Field(
+        default_factory=lambda: os.getenv("CRISIS_REBOUND_ENABLED", "true").lower() == "true"
+    )
+    crisis_market_panic_threshold: float = -2.5  # 코스닥 지수 폭락일 <= -2.5% (패턴 A 전용 트리거)
+    crisis_pattern_c_open_gap_max: float = -1.0  # 패턴 C (1순위): 아침 시초 갭하락 <= -1.0%
+    crisis_pattern_c_body_min: float = 0.5       # 패턴 C (1순위): 양봉 몸통 (종가 - 시가) / 시가 >= +0.5%
+    crisis_pattern_a_drop_max: float = -6.0      # 패턴 A (2순위): 당일 낙폭 <= -6.0% (과매도 투매 압축)
+    crisis_turnover_rank_max: int = 20           # 거래대금 Top 20 이내
+    crisis_max_slots: int = 2                    # 패닉일 최대 2개 슬롯 배분
+
     @property
     def endpoints(self) -> KISEndpoints:
         return KISEndpoints.create(self.env)

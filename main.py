@@ -78,6 +78,7 @@ def run_single_backtest(
     if hasattr(args, "trailing_buffer") and args.trailing_buffer is not None:
         exit_kwargs["trailing_buffer_pct"] = args.trailing_buffer
 
+    single_slot_cap = args.cap_pct if (hasattr(args, "cap_pct") and args.cap_pct and max_daily_positions > 0 and args.cap_pct > (1.0 / max_daily_positions)) else None
     strategy = build_strategy(
         scanner_name=args.scanner,
         entry_name=args.entry,
@@ -89,15 +90,32 @@ def run_single_backtest(
         dynamic_slots=dynamic_slots,
         ambiguity_mode=ambiguity_mode,
         dynamic=getattr(args, "dynamic", True),
+        single_slot_cap_pct=single_slot_cap,
     )
-    broker = BacktestBroker(initial_capital=args.capital)
+    slippage = getattr(args, "slippage", 0.00035)
+    broker = BacktestBroker(initial_capital=args.capital, slippage_rate=slippage)
     clock = SimulatedClock()
+    pool_file = getattr(args, "pool_file", "research/round2_candidate_pool.parquet")
     feed = HistoricalDataFeed(
         data_dir=data_dir,
         start_date=args.start,
         end_date=args.end,
+        pool_file=pool_file,
     )
-    risk_manager = RiskManager()
+    # Risk manager setup: overnight strategies liquidate prior-day holds at 09:00 AM,
+    # so intraday day-trading circuit breakers should not falsely trip on overnight holds.
+    is_anchor_strat = args.scanner in ("champion_b", "anchor_body_micro", "anchor_close") or "anchor" in args.scanner
+    default_max_loss = args.capital if is_anchor_strat else 500_000.0
+    default_max_losses = 999 if is_anchor_strat else 2
+
+    max_loss = getattr(args, "max_daily_loss", None)
+    if max_loss is None:
+        max_loss = default_max_loss
+    max_consec = getattr(args, "max_consecutive_losses", None)
+    if max_consec is None:
+        max_consec = default_max_losses
+
+    risk_manager = RiskManager(max_daily_loss=max_loss, max_consecutive_losses=max_consec)
 
     engine = TradingEngine(
         strategy=strategy,
@@ -344,6 +362,11 @@ def main() -> None:
     bt_parser.add_argument("--dynamic", dest="dynamic", action="store_true", default=True, help="Adaptive variables (default: True)")
     bt_parser.add_argument("--fixed", dest="dynamic", action="store_false", help="Legacy fixed constants")
     bt_parser.add_argument("--no-export", action="store_true", help="Disable automatic CSV export")
+    bt_parser.add_argument("--slippage", type=float, default=0.00035, help="Slippage rate (default: 0.00035 = ~1 tick)")
+    bt_parser.add_argument("--pool-file", default="research/round2_candidate_pool.parquet", help="Multi-year candidate pool file")
+    bt_parser.add_argument("--cap-pct", type=float, default=0.50, help="Single-stock cap percentage (default: 0.50, or 0.60 for max profit)")
+    bt_parser.add_argument("--max-daily-loss", type=float, default=None, help="Daily loss cap for circuit breaker")
+    bt_parser.add_argument("--max-consecutive-losses", type=int, default=None, help="Consecutive losses circuit breaker")
 
     # audit
     audit_parser = subparsers.add_parser("audit", help="Run Universal Strategy Contract Suite audit")
