@@ -73,16 +73,36 @@ def run_single_backtest(
         scanner_kwargs["max_gap_pct"] = args.max_gap
     if hasattr(args, "max_mae") and args.max_mae is not None:
         scanner_kwargs["max_mae_pct"] = args.max_mae
+    if hasattr(args, "priority") and args.priority is not None and args.scanner == "open_window":
+        scanner_kwargs["race_priority_mode"] = args.priority
+        scanner_kwargs["priority_policy"] = args.priority
+
+    entry_kwargs = {}
+    if args.entry == "open_window":
+        if hasattr(args, "entry_start") and args.entry_start is not None:
+            entry_kwargs["start_time_min"] = args.entry_start
+        if hasattr(args, "entry_end") and args.entry_end is not None:
+            entry_kwargs["end_time_min"] = args.entry_end
+        if hasattr(args, "entry_style") and args.entry_style is not None:
+            entry_kwargs["entry_style"] = args.entry_style
 
     exit_kwargs = {}
     if hasattr(args, "trailing_buffer") and args.trailing_buffer is not None:
         exit_kwargs["trailing_buffer_pct"] = args.trailing_buffer
+    if args.exit == "trailing_lock":
+        if hasattr(args, "tp1") and args.tp1 is not None:
+            exit_kwargs["tp1_target_pct"] = args.tp1
+        if hasattr(args, "sl") and args.sl is not None:
+            exit_kwargs["hard_stop_pct"] = args.sl
+        if hasattr(args, "trailing_offset") and args.trailing_offset is not None:
+            exit_kwargs["trailing_offset_pct"] = args.trailing_offset
 
     strategy = build_strategy(
         scanner_name=args.scanner,
         entry_name=args.entry,
         exit_name=args.exit,
         scanner_kwargs=scanner_kwargs,
+        entry_kwargs=entry_kwargs,
         exit_kwargs=exit_kwargs,
         max_daily_positions=max_daily_positions,
         total_capital=args.capital,
@@ -344,6 +364,13 @@ def main() -> None:
     bt_parser.add_argument("--dynamic", dest="dynamic", action="store_true", default=True, help="Adaptive variables (default: True)")
     bt_parser.add_argument("--fixed", dest="dynamic", action="store_false", help="Legacy fixed constants")
     bt_parser.add_argument("--no-export", action="store_true", help="Disable automatic CSV export")
+    bt_parser.add_argument("--entry-start", type=int, default=0, help="Entry start minute (0 = 09:00:00)")
+    bt_parser.add_argument("--entry-end", type=int, default=10, help="Entry end minute (10 = 09:10:00)")
+    bt_parser.add_argument("--entry-style", choices=["orb", "pullback", "volume_surge"], default="orb", help="Entry style")
+    bt_parser.add_argument("--priority", choices=["turnover", "momentum", "gap_stability"], default="turnover", help="Race condition priority")
+    bt_parser.add_argument("--tp1", type=float, default=0.02, help="TP1 profit lock target pct (e.g. 0.02 = +2.0%%)")
+    bt_parser.add_argument("--sl", type=float, default=-0.015, help="Hard stop loss pct (e.g. -0.015 = -1.5%%)")
+    bt_parser.add_argument("--trailing-offset", type=float, default=0.010, help="Trailing offset pct from peak (e.g. 0.010 = -1.0%%)")
 
     # audit
     audit_parser = subparsers.add_parser("audit", help="Run Universal Strategy Contract Suite audit")

@@ -105,7 +105,7 @@ class RealtimeLeaderScanner:
         scan_end_time: Optional[dtime] = None,
         poll_interval_sec: float = 0.5,
         condition_seq: str = "0",
-        condition_name: str = "모닝_돌파주",
+        condition_name: str = "모닝_돌파주도주",
         enable_volume_rank_feeder: bool = True,
         volume_rank_interval_sec: float = 3.0,
         strategy: Any = None,
@@ -274,9 +274,30 @@ class RealtimeLeaderScanner:
                 logger.error(f"Error in scanner callback for {symbol}: {e}")
 
     @staticmethod
-    def _is_target_stock(code: str, name: str = "") -> bool:
-        """Validates 6-digit stock code."""
-        return bool(code and len(str(code).strip()) == 6)
+    def _is_target_stock(code: str, name: str = "", prev_close: Optional[float] = None) -> bool:
+        """
+        Validates common stock code and filters out preferred shares, SPACs, REITs, ETFs, ETNs, and IPO Day-1.
+        """
+        code_str = str(code).strip()
+        # 1. 6-digit ending in '0' (Common share)
+        if len(code_str) != 6 or not code_str.isdigit() or not code_str.endswith("0"):
+            return False
+
+        # 2. Exclude SPAC, REIT, ETF, ETN, Infrastructure funds, Inverses, Leverages
+        name_upper = name.upper()
+        keywords = [
+            "스팩", "SPAC", "리츠", "REIT", "인프라", "펀드",
+            "인버스", "레버리지", "선물", "ETN", "ETF",
+            "KODEX", "TIGER", "ACE", "SOL", "PLUS", "RISE", "KOSEF", "HANARO", "TIMEFOLIO", "히어로즈",
+        ]
+        if any(kw in name_upper for kw in keywords):
+            return False
+
+        # 3. Exclude IPO Day-1 (missing or non-positive prev_close)
+        if prev_close is not None and prev_close <= 0.0:
+            return False
+
+        return True
 
     def take_1min_snapshot(
         self,

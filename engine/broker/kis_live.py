@@ -4,10 +4,12 @@ Strictly implements Korea Market v3 IBroker and integrates with slotted dataclas
 """
 from __future__ import annotations
 
+import time
 import logging
 import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any
+import requests
 
 from engine.models import (
     Order, OrderEvent, OrderSide, OrderType, OrderStatus,
@@ -53,6 +55,149 @@ class KisLiveBroker(IBroker):
             except Exception as e:
                 logger.error(f"Error in live broker event listener: {e}", exc_info=True)
 
+    def _apply_position_fill(self, symbol: str, filled_qty: int, filled_p: float, side: OrderSide) -> None:
+        """Updates internal _positions and _latest_balance on fill."""
+        with self._lock:
+            if side == OrderSide.BUY:
+                if symbol not in self._positions:
+                    self._positions[symbol] = Position(
+                        symbol=symbol,
+                        quantity=filled_qty,
+                        avg_price=filled_p,
+                        current_price=filled_p,
+                        high_water_mark=filled_p,
+                        low_water_mark=filled_p,
+                        entry_dt=datetime.now(),
+                    )
+                else:
+                    pos = self._positions[symbol]
+                    total_cost = (pos.quantity * pos.avg_price) + (filled_qty * filled_p)
+                    pos.quantity += filled_qty
+                    pos.avg_price = total_cost / pos.quantity if pos.quantity > 0 else filled_p
+                    pos.current_price = filled_p
+                    if filled_p > pos.high_water_mark:
+                        pos.high_water_mark = filled_p
+                    if pos.low_water_mark > 0.0:
+                        pos.low_water_mark = min(pos.low_water_mark, filled_p)
+                    else:
+                        pos.low_water_mark = filled_p
+            elif side == OrderSide.SELL and symbol in self._positions:
+                pos = self._positions[symbol]
+                pos.quantity = max(0, pos.quantity - filled_qty)
+                if pos.quantity == 0:
+                    self._positions.pop(symbol, None)
+
+            if self._latest_balance is not None:
+                self._latest_balance = AccountBalance(
+                    total_equity=self._latest_balance.total_equity,
+                    cash=self._latest_balance.cash,
+                    positions=dict(self._positions),
+                )
+
+    def order_cash_buy(
+        self,
+        symbol: str,
+        qty: int,
+        price: int = 0,
+        order_type: str = "01",
+        order: Optional[Order] = None,
+    ) -> Dict[str, Any]:
+        """
+        Executes cash BUY order with Two-Phase Order Idempotency defense.
+        On network timeout or connection drop, does NOT fail immediately;
+        verifies exchange status via inquire_daily_ccld within 1 second to prevent
+        unhedged orphan positions or duplicate orders.
+        """
+        try:
+            return self.client.order_cash_buy(
+                symbol=symbol,
+                qty=qty,
+                price=price,
+                order_type=order_type,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as net_err:
+            logger.warning(
+                f"[{self.mode.upper()}] Buy order network error for {symbol} ({net_err}). "
+                f"Initiating Phase-2 order verification via inquire_daily_ccld..."
+            )
+            time.sleep(1.0)
+            try:
+                ccld_records = self.client.inquire_daily_ccld(symbol=symbol, ccld_dvsn="00") or []
+            except Exception as ccld_err:
+                logger.error(f"Failed to query inquire_daily_ccld during Phase-2 verification: {ccld_err}")
+                ccld_records = []
+
+            # Check if matching order reached exchange
+            matched_rec = None
+            for rec in ccld_records:
+                r_symbol = str(rec.get("pdno") or rec.get("PDNO") or "").strip()
+                r_qty = int(rec.get("ord_qty") or rec.get("ORD_QTY") or 0)
+                r_side = str(rec.get("sll_buy_dvsn_cd") or rec.get("SLL_BUY_DVSN_CD") or "")
+                # SLL_BUY_DVSN_CD "02" represents BUY in KIS
+                if r_symbol == symbol and r_qty == qty and r_side in ("02", "BUY", ""):
+                    matched_rec = rec
+                    break
+
+            if matched_rec:
+                odno = str(matched_rec.get("odno") or matched_rec.get("ODNO") or "")
+                filled_qty = int(matched_rec.get("ccld_qty") or matched_rec.get("CCLD_QTY") or 0)
+                filled_p = float(matched_rec.get("ccld_unpr") or matched_rec.get("CCLD_UNPR") or 0.0)
+                logger.info(
+                    f"[{self.mode.upper()}] Phase-2 Verification SUCCEEDED: Order reached exchange! "
+                    f"ODNO: {odno}, Filled: {filled_qty}/{qty} @ {filled_p:,.0f}"
+                )
+                if order:
+                    order.order_id = odno or order.order_id
+                    if filled_qty >= qty and filled_p > 0:
+                        order.status = OrderStatus.FILLED
+                        self._apply_position_fill(symbol, filled_qty, filled_p, OrderSide.BUY)
+                        self._emit_event(OrderEvent(
+                            order_id=order.order_id,
+                            symbol=symbol,
+                            side=OrderSide.BUY,
+                            status=OrderStatus.FILLED,
+                            filled_price=filled_p,
+                            filled_quantity=filled_qty,
+                            dt=datetime.now(),
+                            message=f"Phase-2 Verified Filled (ODNO: {odno})",
+                        ))
+                    elif filled_qty > 0 and filled_p > 0:
+                        order.status = OrderStatus.PARTIALLY_FILLED
+                        order.unfilled_quantity = qty - filled_qty
+                        self._apply_position_fill(symbol, filled_qty, filled_p, OrderSide.BUY)
+                        with self._lock:
+                            self._pending_orders[order.order_id] = order
+                        self._emit_event(OrderEvent(
+                            order_id=order.order_id,
+                            symbol=symbol,
+                            side=OrderSide.BUY,
+                            status=OrderStatus.PARTIALLY_FILLED,
+                            filled_price=filled_p,
+                            filled_quantity=filled_qty,
+                            dt=datetime.now(),
+                            message=f"Phase-2 Verified Partial Fill (ODNO: {odno})",
+                        ))
+                    else:
+                        order.status = OrderStatus.PENDING
+                        with self._lock:
+                            self._pending_orders[order.order_id] = order
+                return {
+                    "rt_cd": "0",
+                    "msg1": "PHASE2_VERIFIED_ON_EXCHANGE",
+                    "output": {"ODNO": odno},
+                }
+            else:
+                logger.error(
+                    f"[{self.mode.upper()}] Phase-2 Verification CONFIRMED: Order {symbol} x {qty} "
+                    f"did NOT reach exchange. Marking order as REJECTED."
+                )
+                if order:
+                    order.status = OrderStatus.REJECTED
+                return {
+                    "rt_cd": "TIMEOUT_REJECTED",
+                    "msg1": f"Order not on exchange after timeout: {net_err}",
+                }
+
     def submit_order(self, order: Order) -> str:
         """
         Sends order to KIS Open API.
@@ -74,11 +219,12 @@ class KisLiveBroker(IBroker):
             order_type_str = "01" if is_market else ("11" if "IOC" in (order.tag or "").upper() else "00")
 
             if order.side == OrderSide.BUY:
-                resp = self.client.order_cash_buy(
+                resp = self.order_cash_buy(
                     symbol=order.symbol,
                     qty=int(order.quantity),
                     price=order_p,
                     order_type=order_type_str,
+                    order=order,
                 )
             else:
                 resp = self.client.order_cash_sell(
@@ -93,8 +239,14 @@ class KisLiveBroker(IBroker):
                 output = resp.get("output", {})
                 odno = str(output.get("ODNO", ""))
                 order.order_id = odno or order.order_id
-                order.status = OrderStatus.PENDING
 
+                # If Phase-2 verification already settled fill or pending event, return order_id
+                if order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+                    return order.order_id
+                if order.order_id in self._pending_orders:
+                    return order.order_id
+
+                order.status = OrderStatus.PENDING
                 with self._lock:
                     self._pending_orders[order.order_id] = order
 
@@ -304,41 +456,7 @@ class KisLiveBroker(IBroker):
             else:
                 self._pending_orders.pop(order_no, None)
 
-            if side == OrderSide.BUY:
-                if symbol not in self._positions:
-                    self._positions[symbol] = Position(
-                        symbol=symbol,
-                        quantity=filled_qty,
-                        avg_price=filled_p,
-                        current_price=filled_p,
-                        high_water_mark=filled_p,
-                        low_water_mark=filled_p,
-                        entry_dt=datetime.now(),
-                    )
-                else:
-                    pos = self._positions[symbol]
-                    total_cost = (pos.quantity * pos.avg_price) + (filled_qty * filled_p)
-                    pos.quantity += filled_qty
-                    pos.avg_price = total_cost / pos.quantity if pos.quantity > 0 else filled_p
-                    pos.current_price = filled_p
-                    if filled_p > pos.high_water_mark:
-                        pos.high_water_mark = filled_p
-                    if pos.low_water_mark > 0.0:
-                        pos.low_water_mark = min(pos.low_water_mark, filled_p)
-                    else:
-                        pos.low_water_mark = filled_p
-            elif side == OrderSide.SELL and symbol in self._positions:
-                pos = self._positions[symbol]
-                pos.quantity = max(0, pos.quantity - filled_qty)
-                if pos.quantity == 0:
-                    self._positions.pop(symbol, None)
-
-            if self._latest_balance is not None:
-                self._latest_balance = AccountBalance(
-                    total_equity=self._latest_balance.total_equity,
-                    cash=self._latest_balance.cash,
-                    positions=dict(self._positions),
-                )
+            self._apply_position_fill(symbol, filled_qty, filled_p, side)
 
         status = OrderStatus.PARTIALLY_FILLED if is_partial else OrderStatus.FILLED
         logger.info(

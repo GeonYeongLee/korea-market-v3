@@ -64,6 +64,8 @@ class ScannerContractVerifier:
 
         # Baseline run up to 09:02 (turnover meets criteria)
         scanner.on_day_open(d)
+        if hasattr(scanner, "_day_prev_closes"):
+            scanner._day_prev_closes["005930"] = 49000.0
         bar1 = self._create_bar("005930", 1, turnover=100_000_000.0, cum_turnover=100_000_000.0)
         bar2 = self._create_bar("005930", 2, turnover=400_000_000.0, cum_turnover=1_200_000_000.0)
         scanner.on_bar(d, bar1)
@@ -81,6 +83,8 @@ class ScannerContractVerifier:
 
         # Fuzzed run: Repeat t1, t2 to confirm deterministic reproducibility
         scanner.on_day_open(d)
+        if hasattr(scanner, "_day_prev_closes"):
+            scanner._day_prev_closes["005930"] = 49000.0
         scanner.on_bar(d, bar1)
         res_t2_repeat = scanner.on_bar(d, bar2)
         repeat_set = set(res_t2_repeat or [])
@@ -118,6 +122,10 @@ class ScannerContractVerifier:
 
         # Order 1: A -> B -> C
         scanner.on_day_open(d)
+        if hasattr(scanner, "_day_prev_closes"):
+            scanner._day_prev_closes["005930"] = 49000.0
+            scanner._day_prev_closes["000660"] = 49000.0
+            scanner._day_prev_closes["035420"] = 49000.0
         candidates_1 = set()
         for bar in [bar_a, bar_b, bar_c]:
             res = scanner.on_bar(d, bar)
@@ -126,6 +134,10 @@ class ScannerContractVerifier:
 
         # Order 2: C -> B -> A
         scanner.on_day_open(d)
+        if hasattr(scanner, "_day_prev_closes"):
+            scanner._day_prev_closes["005930"] = 49000.0
+            scanner._day_prev_closes["000660"] = 49000.0
+            scanner._day_prev_closes["035420"] = 49000.0
         candidates_2 = set()
         for bar in [bar_c, bar_b, bar_a]:
             res = scanner.on_bar(d, bar)
@@ -157,6 +169,8 @@ class ScannerContractVerifier:
 
         # Day 1: Qualify a stock
         scanner.on_day_open(day1)
+        if hasattr(scanner, "_day_prev_closes"):
+            scanner._day_prev_closes["005930"] = 49000.0
         bar_qual = self._create_bar("005930", 2, d=day1, turnover=400_000_000.0, cum_turnover=1_200_000_000.0)
         res_d1 = scanner.on_bar(day1, bar_qual)
         if not res_d1 or "005930" not in res_d1:
@@ -170,6 +184,8 @@ class ScannerContractVerifier:
         # Day 2: Call on_day_open twice (Idempotence)
         scanner.on_day_open(day2)
         scanner.on_day_open(day2)
+        if hasattr(scanner, "_day_prev_closes"):
+            scanner._day_prev_closes["005930"] = 49000.0
 
         # Provide a low-turnover bar on Day 2 that should NOT qualify
         bar_unqual = self._create_bar("005930", 1, d=day2, turnover=10_000_000.0, cum_turnover=10_000_000.0)

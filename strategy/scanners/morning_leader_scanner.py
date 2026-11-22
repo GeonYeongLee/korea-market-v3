@@ -38,7 +38,7 @@ class MorningLeaderScanner(IScanner):
         daily_file: str = "data/dataset_2y/daily_bars_2y.parquet",
         start_time: time = time(9, 1),
         end_time: time = time(9, 3),
-        condition_name: str = "모닝_돌파주",
+        condition_name: str = "모닝_돌파주도주",
         condition_seq: str = "0",
         use_dynamic_turnover: bool = True,
         feature_provider: Optional[DynamicFeatureProvider] = None,

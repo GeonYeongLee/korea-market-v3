@@ -92,6 +92,9 @@ class UniversalStrategyAuditor:
         broker.register_event_listener(lambda ev: strategy.on_order_event(ctx, ev))
         strategy.on_start(ctx)
         strategy.on_day_open(ctx, today)
+        if hasattr(strategy.scanner, "_day_prev_closes"):
+            strategy.scanner._day_prev_closes["005930"] = 49000.0
+            strategy.scanner._day_prev_closes["000660"] = 147000.0
         strategy.max_daily_positions = 1
         strategy.current_slot_notional = strategy.total_capital / 1
         if hasattr(strategy.entry, "target_notional"):
