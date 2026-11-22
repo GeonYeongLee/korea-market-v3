@@ -125,6 +125,14 @@ class MorningLeaderScanner(IScanner):
         """Returns registered day open price for symbol."""
         return self._day_open_prices.get(symbol)
 
+    def get_prev_close(self, symbol: str) -> Optional[float]:
+        """Returns registered previous close price for symbol."""
+        return self._day_prev_closes.get(symbol)
+
+    def get_symbol_metadata(self, symbol: str) -> Dict[str, Any]:
+        """Returns symbol metadata dictionary if present."""
+        return getattr(self, "_symbol_metadata", {}).get(symbol, {})
+
     def on_bar(self, current_date: date, bar: MinuteBar) -> Optional[List[str]]:
         # 1. Extreme numerical anomaly defense
         if not (math.isfinite(bar.open) and math.isfinite(bar.high) and math.isfinite(bar.low) and math.isfinite(bar.close)):

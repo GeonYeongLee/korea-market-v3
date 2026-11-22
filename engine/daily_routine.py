@@ -107,20 +107,28 @@ class DailyRoutineOrchestrator:
         env_mode = "vts" if self.mode == "mock" else "real"
         cfg = settings.switch_env(env_mode)
         broker = KisLiveBroker(mode=env_mode, cfg=cfg)
-        try:
-            broker.sync_account_state()
-            bal = broker.get_balance()
-            if bal and bal.cash > 0:
-                if bal.cash < self.capital:
-                    console.print(
-                        f"[bold yellow]💡 [예수금 비례 1/N 배분] 계좌 예수금({bal.cash:,.0f}원)이 기준 원금({self.capital:,.0f}원) 미만입니다.[/bold yellow]\n"
-                        f"   ➜ 가용 예수금을 기준으로 당일 슬롯에 1/N 배분하여 안전 매매합니다."
-                    )
-                if hasattr(self.strategy, "sync_capital_with_balance"):
-                    self.strategy.sync_capital_with_balance(bal.cash)
-            logger.info("Pre-market account state synced successfully.")
-        except Exception as e:
-            logger.debug(f"Could not pre-sync account state: {e}")
+        synced = False
+        for attempt in range(1, 4):
+            try:
+                broker.sync_account_state()
+                bal = broker.get_balance()
+                if bal and bal.cash > 0:
+                    if bal.cash < self.capital:
+                        console.print(
+                            f"[bold yellow]💡 [예수금 비례 1/N 배분] 계좌 예수금({bal.cash:,.0f}원)이 기준 원금({self.capital:,.0f}원) 미만입니다.[/bold yellow]\n"
+                            f"   ➜ 가용 예수금을 기준으로 당일 슬롯에 1/N 배분하여 안전 매매합니다."
+                        )
+                    if hasattr(self.strategy, "sync_capital_with_balance"):
+                        self.strategy.sync_capital_with_balance(bal.cash)
+                logger.info("Pre-market account state synced successfully.")
+                synced = True
+                break
+            except Exception as e:
+                logger.warning(f"Pre-market account state sync attempt {attempt}/3 failed: {e}")
+                if attempt < 3:
+                    time.sleep(1.0)
+        if not synced:
+            logger.warning("Could not pre-sync account state after 3 attempts.")
 
         try:
             import core.krx_symbols
@@ -246,37 +254,47 @@ class DailyRoutineOrchestrator:
             )
 
             try:
+                datafeed.start()
+                time.sleep(1.0)
                 if max_slots > 0:
                     scanner.start()
-                datafeed.start()
 
                 engine_thread = threading.Thread(target=engine.run, daemon=True, name="TradingEngineThread")
                 engine_thread.start()
 
                 console.print("[green]✓ 실시간 스캐너 및 웹소켓 호가 엔진이 가동되었습니다. 매매 완료를 실시간 감시합니다...[/green]")
 
-                eod_liquidated_symbols = set()
+                last_eod_attempt: Dict[str, float] = {}
                 while True:
                     time.sleep(1.0)
                     curr_t = datetime.now().time()
 
-                    # 15:20 KRX 장마감 동시호가 전량 청산 (오버나잇 0% 불변량)
-                    if curr_t >= dtime(15, 20, 0):
+                    # 15:20 KRX 장마감 동시호가 전량 청산 (오버나잇 0% 불변량, 15:28:00까지 지속 재시도)
+                    if curr_t >= dtime(15, 20, 0) and curr_t <= dtime(15, 28, 0):
                         open_pos = broker.get_positions()
                         if open_pos:
+                            from engine.models import Order, OrderSide, OrderType
                             for sym, p in list(open_pos.items()):
-                                if sym not in eod_liquidated_symbols:
-                                    eod_liquidated_symbols.add(sym)
-                                    console.print(f"\n[bold yellow]⚠️ [STAGE 3] 15:20 KRX 장마감 동시호가 청산 집행: {sym}[/bold yellow]")
-                                    from engine.models import Order, OrderSide, OrderType
-                                    broker.submit_order(Order(
-                                        order_id=f"EOD_{sym}_{int(time.time())}",
-                                        symbol=sym,
-                                        side=OrderSide.SELL,
-                                        order_type=OrderType.MARKET,
-                                        quantity=p.quantity,
-                                        tag="EOD_AUCTION_1520",
-                                    ))
+                                if p.quantity > 0:
+                                    last_att = last_eod_attempt.get(sym, 0.0)
+                                    if time.time() - last_att >= 2.0:
+                                        last_eod_attempt[sym] = time.time()
+                                        console.print(
+                                            f"\n[bold yellow]⚠️ [STAGE 3] 15:20 KRX 장마감 동시호가 청산 집행: {sym} ({p.quantity}주)[/bold yellow]"
+                                        )
+                                        # First cancel resting orders to avoid '매도가능수량 부족'
+                                        broker.cancel_pending_orders(sym)
+                                        time.sleep(0.5)
+                                        curr_p = broker.get_position(sym)
+                                        if curr_p and curr_p.quantity > 0:
+                                            broker.submit_order(Order(
+                                                order_id=f"EOD_{sym}_{int(time.time())}",
+                                                symbol=sym,
+                                                side=OrderSide.SELL,
+                                                order_type=OrderType.MARKET,
+                                                quantity=curr_p.quantity,
+                                                tag="EOD_AUCTION_1520",
+                                            ))
 
                     # Check daily trading completion
                     is_done = getattr(self.strategy, "is_daily_trading_completed", False)

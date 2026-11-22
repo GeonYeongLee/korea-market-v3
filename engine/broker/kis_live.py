@@ -41,6 +41,8 @@ class KisLiveBroker(IBroker):
         self._lock = threading.RLock()
         self._positions: Dict[str, Position] = {}
         self._pending_orders: Dict[str, Order] = {}
+        self._early_executions: Dict[str, Dict[str, Any]] = {}
+        self._order_submit_time: Dict[str, float] = {}
         self._latest_balance: Optional[AccountBalance] = None
         self._initial_capital: float = 10_000_000.0
 
@@ -87,12 +89,18 @@ class KisLiveBroker(IBroker):
                 if pos.quantity == 0:
                     self._positions.pop(symbol, None)
 
-            if self._latest_balance is not None:
-                self._latest_balance = AccountBalance(
-                    total_equity=self._latest_balance.total_equity,
-                    cash=self._latest_balance.cash,
-                    positions=dict(self._positions),
-                )
+            curr_cash = self._latest_balance.cash if self._latest_balance is not None else self._initial_capital
+            if side == OrderSide.BUY:
+                curr_cash = max(0.0, curr_cash - filled_qty * filled_p * 1.00015)
+            elif side == OrderSide.SELL:
+                curr_cash += filled_qty * filled_p * 0.9980
+
+            pos_val = sum(p.quantity * p.current_price for p in self._positions.values())
+            self._latest_balance = AccountBalance(
+                total_equity=curr_cash + pos_val,
+                cash=curr_cash,
+                positions=dict(self._positions),
+            )
 
     def order_cash_buy(
         self,
@@ -198,6 +206,96 @@ class KisLiveBroker(IBroker):
                     "msg1": f"Order not on exchange after timeout: {net_err}",
                 }
 
+    def order_cash_sell(
+        self,
+        symbol: str,
+        qty: int,
+        price: int = 0,
+        order_type: str = "01",
+        order: Optional[Order] = None,
+    ) -> Dict[str, Any]:
+        """
+        Executes cash SELL order with Two-Phase Order Idempotency defense.
+        On network timeout or connection drop, queries inquire_daily_ccld within 1.0s.
+        If found, marks FILLED; if not found, resubmits emergency market sell.
+        """
+        try:
+            return self.client.order_cash_sell(
+                symbol=symbol,
+                qty=qty,
+                price=price,
+                order_type=order_type,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as net_err:
+            logger.warning(
+                f"[{self.mode.upper()}] Sell order network error for {symbol} ({net_err}). "
+                f"Initiating Phase-2 order verification via inquire_daily_ccld..."
+            )
+            time.sleep(1.0)
+            try:
+                ccld_records = self.client.inquire_daily_ccld(symbol=symbol, ccld_dvsn="00") or []
+            except Exception as ccld_err:
+                logger.error(f"Failed to query inquire_daily_ccld during Phase-2 sell verification: {ccld_err}")
+                ccld_records = []
+
+            # Check if matching order reached exchange (sll_buy_dvsn_cd: '01' for SELL in KIS)
+            matched_rec = None
+            for rec in ccld_records:
+                r_symbol = str(rec.get("pdno") or rec.get("PDNO") or "").strip()
+                r_qty = int(rec.get("ord_qty") or rec.get("ORD_QTY") or 0)
+                r_side = str(rec.get("sll_buy_dvsn_cd") or rec.get("SLL_BUY_DVSN_CD") or "")
+                if r_symbol == symbol and r_qty == qty and r_side in ("01", "SELL", ""):
+                    matched_rec = rec
+                    break
+
+            if matched_rec:
+                odno = str(matched_rec.get("odno") or matched_rec.get("ODNO") or "")
+                filled_qty = int(matched_rec.get("ccld_qty") or matched_rec.get("CCLD_QTY") or 0)
+                filled_p = float(matched_rec.get("ccld_unpr") or matched_rec.get("CCLD_UNPR") or 0.0)
+                logger.info(
+                    f"[{self.mode.upper()}] Phase-2 Sell Verification SUCCEEDED: Order reached exchange! "
+                    f"ODNO: {odno}, Filled: {filled_qty}/{qty} @ {filled_p:,.0f}"
+                )
+                if order:
+                    order.order_id = odno or order.order_id
+                    order.status = OrderStatus.FILLED
+                    self._apply_position_fill(symbol, filled_qty if filled_qty > 0 else qty, filled_p, OrderSide.SELL)
+                    self._emit_event(OrderEvent(
+                        order_id=order.order_id,
+                        symbol=symbol,
+                        side=OrderSide.SELL,
+                        status=OrderStatus.FILLED,
+                        filled_price=filled_p,
+                        filled_quantity=filled_qty if filled_qty > 0 else qty,
+                        dt=datetime.now(),
+                        message=f"Phase-2 Verified Sell Filled (ODNO: {odno})",
+                    ))
+                return {
+                    "rt_cd": "0",
+                    "msg1": "PHASE2_VERIFIED_ON_EXCHANGE",
+                    "output": {"ODNO": odno},
+                }
+            else:
+                logger.warning(
+                    f"[{self.mode.upper()}] Phase-2 Sell Verification: Order {symbol} x {qty} "
+                    f"did NOT reach exchange. Resubmitting emergency market sell..."
+                )
+                try:
+                    return self.client.order_cash_sell(
+                        symbol=symbol,
+                        qty=qty,
+                        price=0,
+                        order_type="01",
+                    )
+                except Exception as resubmit_err:
+                    logger.error(f"Emergency market sell failed for {symbol}: {resubmit_err}")
+                    if order:
+                        order.status = OrderStatus.REJECTED
+                    return {
+                        "rt_cd": "EMERGENCY_SELL_FAILED",
+                        "msg1": str(resubmit_err),
+                    }
+
     def submit_order(self, order: Order) -> str:
         """
         Sends order to KIS Open API.
@@ -227,11 +325,12 @@ class KisLiveBroker(IBroker):
                     order=order,
                 )
             else:
-                resp = self.client.order_cash_sell(
+                resp = self.order_cash_sell(
                     symbol=order.symbol,
                     qty=int(order.quantity),
                     price=order_p,
                     order_type=order_type_str,
+                    order=order,
                 )
 
             rt_cd = resp.get("rt_cd", "")
@@ -246,9 +345,20 @@ class KisLiveBroker(IBroker):
                 if order.order_id in self._pending_orders:
                     return order.order_id
 
-                order.status = OrderStatus.PENDING
                 with self._lock:
+                    if odno and odno in self._early_executions:
+                        self._early_executions.pop(odno, None)
+                        order.status = OrderStatus.FILLED
+                        logger.info(
+                            f"[{self.mode.upper()}] Order {odno} matched early execution notice; marked FILLED immediately."
+                        )
+                        return order.order_id
+
+                    order.status = OrderStatus.PENDING
+                    if order.created_at is None:
+                        order.created_at = datetime.now()
                     self._pending_orders[order.order_id] = order
+                    self._order_submit_time[order.order_id] = time.time()
 
                 logger.info(
                     f"[{self.mode.upper()}] Order submitted successfully: {order.side.value} {order.quantity} {order.symbol} "
@@ -325,6 +435,7 @@ class KisLiveBroker(IBroker):
             is_success = resp.get("rt_cd") == "0"
             with self._lock:
                 self._pending_orders.pop(order_id, None)
+                self._order_submit_time.pop(order_id, None)
 
             if is_success:
                 self.sync_account_state()
@@ -353,6 +464,7 @@ class KisLiveBroker(IBroker):
             logger.warning(f"Could not cancel order {order_id}: {e}")
             with self._lock:
                 ord_ = self._pending_orders.pop(order_id, None)
+                self._order_submit_time.pop(order_id, None)
                 symbol = ord_.symbol if ord_ else ""
                 side = ord_.side if ord_ else OrderSide.BUY
             self._emit_event(OrderEvent(
@@ -378,6 +490,35 @@ class KisLiveBroker(IBroker):
                 if self.cancel_order(pend_id):
                     cancelled_ids.append(pend_id)
         return cancelled_ids
+
+    def cancel_stale_buy_orders(self, max_age_sec: float = 45.0) -> List[str]:
+        """
+        Cancels buy orders pending > max_age_sec so resting bids from VI spikes
+        or rapid market moves do not fill on a subsequent dump.
+        """
+        now = datetime.now()
+        now_ts = time.time()
+        stale_order_ids: List[str] = []
+        with self._lock:
+            for order_id, order in list(self._pending_orders.items()):
+                if order.side == OrderSide.BUY:
+                    age = None
+                    if order_id in self._order_submit_time:
+                        age = now_ts - self._order_submit_time[order_id]
+                    elif order.created_at is not None:
+                        age = (now - order.created_at).total_seconds()
+
+                    if age is not None and age >= max_age_sec:
+                        stale_order_ids.append(order_id)
+
+        cancelled: List[str] = []
+        for oid in stale_order_ids:
+            logger.warning(
+                f"[{self.mode.upper()}] Buy order {oid} pending > {max_age_sec}s. Cancelling stale resting bid..."
+            )
+            if self.cancel_order(oid):
+                cancelled.append(oid)
+        return cancelled
 
     def get_position(self, symbol: str) -> Optional[Position]:
         """Returns active Position or None."""
@@ -452,9 +593,13 @@ class KisLiveBroker(IBroker):
                     pend_order.status = OrderStatus.PARTIALLY_FILLED
                 else:
                     self._pending_orders.pop(order_no, None)
+                    self._order_submit_time.pop(order_no, None)
                     pend_order.status = OrderStatus.FILLED
             else:
                 self._pending_orders.pop(order_no, None)
+                self._order_submit_time.pop(order_no, None)
+                if order_no:
+                    self._early_executions[order_no] = notice
 
             self._apply_position_fill(symbol, filled_qty, filled_p, side)
 
@@ -507,7 +652,14 @@ class KisLiveBroker(IBroker):
             out1 = resp.get("holdings", [])
             out2 = resp.get("summary", {})
 
-            cash = float(out2.get("dnca_tot_amt", 0.0))  # 예수금
+            ord_cash_raw = out2.get("ord_psbl_cash")
+            if ord_cash_raw is not None and str(ord_cash_raw).strip() != "":
+                try:
+                    cash = float(ord_cash_raw)
+                except (ValueError, TypeError):
+                    cash = float(out2.get("dnca_tot_amt", 0.0))
+            else:
+                cash = float(out2.get("dnca_tot_amt", 0.0))
             tot_equity = float(out2.get("tot_evlu_amt", cash))  # 총평가금액
 
             with self._lock:

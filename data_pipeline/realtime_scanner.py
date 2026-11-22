@@ -243,15 +243,9 @@ class RealtimeLeaderScanner:
 
                     parsed_bars = parse_kis_minute_bars(symbol, raw_bars)
                     for bar in parsed_bars:
-                        if self.strategy:
-                            if hasattr(self.strategy, "on_bar"):
-                                try:
-                                    self.strategy.on_bar(self.context, bar)
-                                except TypeError:
-                                    self.strategy.on_bar(bar.date, bar)
-                            elif hasattr(self.strategy, "scanner") and hasattr(self.strategy.scanner, "on_bar"):
-                                self.strategy.scanner.on_bar(bar.date, bar)
-                    logger.info(f"📊 [{symbol}] Synced & registered {len(parsed_bars)} 1-minute bars from KIS REST API.")
+                        if self.strategy and hasattr(self.strategy, "scanner") and hasattr(self.strategy.scanner, "on_bar"):
+                            self.strategy.scanner.on_bar(bar.date, bar)
+                    logger.info(f"📊 [{symbol}] Synced & registered {len(parsed_bars)} 1-minute bars to scanner indicators.")
             except Exception as e:
                 logger.warning(f"⚠️ [{symbol}] Could not sync 1-minute bars on promotion: {e}")
 
@@ -444,27 +438,23 @@ class RealtimeLeaderScanner:
                             for r in rank_items[:30]:  # Top 30 UN turnover leaders
                                 r_code = str(r.get("mksc_shrn_iscd") or r.get("stck_shrn_iscd") or "").strip()
                                 if r_code and r_code not in existing_codes and self._is_target_stock(r_code):
-                                    # Fetch official KRX current quote for consistent 09:00:00 regular open price & range
-                                    try:
-                                        p_j = self.client.get_current_price(r_code, market_div="J")
-                                        if p_j and float(p_j.get("stck_prpr", 0.0) or 0.0) > 0:
-                                            tot_to = float(r.get("_tot_to", 0.0) or r.get("acml_tr_pbmn", 0.0) or 0.0)
-                                            norm_item = {
-                                                "code": r_code,
-                                                "name": r.get("hts_kor_isnm") or p_j.get("rprs_mrkt_kor_name", ""),
-                                                "price": p_j.get("stck_prpr", "0"),
-                                                "open": p_j.get("stck_oprc", "0"),
-                                                "high": p_j.get("stck_hgpr", "0"),
-                                                "low": p_j.get("stck_lwpr", "0"),
-                                                "trade_amt": str(tot_to / 1000.0),
-                                                "acml_vol": r.get("acml_vol", "0"),
-                                                "chgrate": p_j.get("prdy_ctrt", "0"),
-                                                "_source": "VOLUME_RANK_UN",
-                                            }
-                                            items.append(norm_item)
-                                            existing_codes.add(r_code)
-                                    except Exception as q_err:
-                                        logger.debug(f"VolumeRank candidate quote fetch failed for {r_code}: {q_err}")
+                                    stck_prpr = str(r.get("stck_prpr", "0") or "0")
+                                    if float(stck_prpr or 0.0) > 0:
+                                        tot_to = float(r.get("_tot_to", 0.0) or r.get("acml_tr_pbmn", 0.0) or 0.0)
+                                        norm_item = {
+                                            "code": r_code,
+                                            "name": str(r.get("hts_kor_isnm", "") or ""),
+                                            "price": stck_prpr,
+                                            "open": str(r.get("stck_oprc", "0") or "0"),
+                                            "high": str(r.get("stck_hgpr", "0") or "0"),
+                                            "low": str(r.get("stck_lwpr", "0") or "0"),
+                                            "trade_amt": str(tot_to / 1000.0),
+                                            "acml_vol": str(r.get("acml_vol", "0") or "0"),
+                                            "chgrate": str(r.get("prdy_ctrt", "0") or "0"),
+                                            "_source": "VOLUME_RANK_UN",
+                                        }
+                                        items.append(norm_item)
+                                        existing_codes.add(r_code)
                     except Exception as vr_err:
                         logger.debug(f"Dual volume rank poll failed: {vr_err}")
 

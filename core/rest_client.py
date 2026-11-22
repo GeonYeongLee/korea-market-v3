@@ -73,12 +73,27 @@ class KISRestClient:
         status_code = 0
         rt_cd = ""
         msg1 = ""
+        backoffs = [0.2, 0.5]
+        max_attempts = 3
         try:
-            if method.upper() == "POST":
-                resp = self.session.post(url, headers=headers, json=json, timeout=timeout)
-            else:
-                resp = self.session.get(url, headers=headers, params=params, timeout=timeout)
-            status_code = getattr(resp, "status_code", 0)
+            for attempt in range(1, max_attempts + 1):
+                if method.upper() == "POST":
+                    resp = self.session.post(url, headers=headers, json=json, timeout=timeout)
+                else:
+                    resp = self.session.get(url, headers=headers, params=params, timeout=timeout)
+                status_code = getattr(resp, "status_code", 0)
+
+                # Transient 5xx retry defense
+                if status_code in (500, 502, 503, 504) and attempt < max_attempts:
+                    delay = backoffs[attempt - 1] if (attempt - 1) < len(backoffs) else 0.5
+                    logger.warning(
+                        f"Transient HTTP {status_code} on {method} {url} (attempt {attempt}/{max_attempts}). "
+                        f"Retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+                break
+
             try:
                 data = resp.json() if hasattr(resp, "json") else {}
                 if isinstance(data, dict):

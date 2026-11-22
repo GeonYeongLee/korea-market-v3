@@ -269,3 +269,147 @@ def test_sync_account_state_and_get_balance(mock_client):
     assert bal.cash == 5_000_000.0
     assert bal.total_equity == 12_100_000.0
     assert "005930" in bal.positions
+
+
+def test_early_execution_notice_race_condition(mock_client):
+    """Notice arrives before submit_order finishes returning ODNO."""
+    broker = KisLiveBroker(mode="vts", client=mock_client)
+    mock_client.order_cash_buy.return_value = {
+        "rt_cd": "0",
+        "msg1": "주문 완료",
+        "output": {"ODNO": "EARLY_001"},
+    }
+
+    # Step 1: WebSocket delivers execution notice BEFORE submit_order returns
+    notice = {
+        "order_no": "EARLY_001",
+        "symbol": "005930",
+        "side": "BUY",
+        "qty": 5,
+        "price": 60000.0,
+    }
+    broker.handle_execution_notice(notice)
+    assert "EARLY_001" in broker._early_executions
+    pos = broker.get_position("005930")
+    assert pos is not None
+    assert pos.quantity == 5
+
+    # Step 2: REST submit_order completes afterwards
+    order = Order(
+        order_id="temp_01",
+        symbol="005930",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=5,
+        price=60000.0,
+    )
+    res_odno = broker.submit_order(order)
+    assert res_odno == "EARLY_001"
+    assert order.status == OrderStatus.FILLED
+    assert "EARLY_001" not in broker._early_executions
+    assert "EARLY_001" not in broker._pending_orders
+
+
+def test_phase2_sell_order_idempotency(mock_client):
+    """Sell order times out, inquire_daily_ccld confirms fill, position clears."""
+    import requests
+    mock_client.order_cash_sell.side_effect = requests.exceptions.Timeout("Sell timeout")
+    broker = KisLiveBroker(mode="vts", client=mock_client)
+    # Give initial position
+    broker._positions["005930"] = Position(
+        symbol="005930",
+        quantity=10,
+        avg_price=70000.0,
+        current_price=70000.0,
+    )
+
+    mock_client.inquire_daily_ccld.return_value = [{
+        "odno": "SELL_CCLD_01",
+        "pdno": "005930",
+        "ord_qty": "10",
+        "ccld_qty": "10",
+        "ccld_unpr": "71000",
+        "sll_buy_dvsn_cd": "01",
+    }]
+
+    order = Order(
+        order_id="sell_ord_1",
+        symbol="005930",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=10,
+    )
+    ret_odno = broker.submit_order(order)
+    assert ret_odno == "SELL_CCLD_01"
+    assert order.status == OrderStatus.FILLED
+    assert broker.get_position("005930") is None
+
+
+def test_cash_margin_tracking_fee_and_tax(mock_client):
+    """BUY fill deducts cash + 0.015% fee, SELL fill adds cash - 0.20% tax/fee."""
+    broker = KisLiveBroker(mode="vts", client=mock_client)
+    broker._initial_capital = 10_000_000.0
+    broker.sync_account_state()
+    # Baseline cash after mock sync is 5,000,000.0
+    init_cash = broker.get_balance().cash
+    assert init_cash == 5_000_000.0
+
+    # BUY fill: 10 shares @ 50,000 KRW = 500,000 KRW
+    # Fee: 500,000 * 0.00015 = 75 KRW -> cost = 500,075 KRW
+    broker.handle_execution_notice({
+        "order_no": "ORD_BUY_1",
+        "symbol": "005930",
+        "side": "BUY",
+        "qty": 10,
+        "price": 50000.0,
+    })
+    expected_cash = 5_000_000.0 - (10 * 50000.0 * 1.00015)
+    assert pytest.approx(broker.get_balance().cash, 0.01) == expected_cash
+
+    # SELL fill: 10 shares @ 60,000 KRW = 600,000 KRW
+    # Proceeds: 600,000 * 0.9980 = 598,800 KRW
+    broker.handle_execution_notice({
+        "order_no": "ORD_SELL_1",
+        "symbol": "005930",
+        "side": "SELL",
+        "qty": 10,
+        "price": 60000.0,
+    })
+    expected_cash += 10 * 60000.0 * 0.9980
+    assert pytest.approx(broker.get_balance().cash, 0.01) == expected_cash
+
+
+def test_cancel_stale_buy_orders(mock_client):
+    """Cancels buy orders resting longer than TTL."""
+    import time
+    broker = KisLiveBroker(mode="vts", client=mock_client)
+    order = Order(
+        order_id="STALE_BUY_1",
+        symbol="005930",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=10,
+        price=50000.0,
+    )
+    broker._pending_orders["STALE_BUY_1"] = order
+    broker._order_submit_time["STALE_BUY_1"] = time.time() - 50.0  # 50s ago
+
+    cancelled = broker.cancel_stale_buy_orders(max_age_sec=45.0)
+    assert "STALE_BUY_1" in cancelled
+    assert "STALE_BUY_1" not in broker._pending_orders
+
+
+def test_sync_account_state_ord_psbl_cash(mock_client):
+    """ord_psbl_cash takes precedence over dnca_tot_amt."""
+    mock_client.get_balance.return_value = {
+        "holdings": [],
+        "summary": {
+            "dnca_tot_amt": "8000000.0",
+            "ord_psbl_cash": "7500000.0",
+            "tot_evlu_amt": "7500000.0",
+        },
+    }
+    broker = KisLiveBroker(mode="vts", client=mock_client)
+    broker.sync_account_state()
+    bal = broker.get_balance()
+    assert bal.cash == 7_500_000.0

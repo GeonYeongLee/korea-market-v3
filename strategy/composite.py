@@ -1,8 +1,4 @@
-"""
-Composite Strategy Orchestrator.
-Assembles 3 decoupled components (Scanner, EntryRule, ExitPolicy) into a unified trading strategy.
-Completely replaces monolithic strategy files with clean, testable Lego blocks.
-"""
+"""Composite Strategy Orchestrator: Assembles Scanner, EntryRule, ExitPolicy into a unified strategy."""
 from __future__ import annotations
 
 import logging
@@ -11,6 +7,7 @@ from typing import Optional, List, Dict, Set, Any
 
 from core.market_regime import MarketRegimeProvider, get_default_market_regime_provider
 from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_feature_provider
+from core.krx_ticks import round_to_krx_tick
 from engine.models import MinuteBar, TickData, OrderEvent, OrderStatus, OrderSide, Position
 from strategy.base import BaseStrategy, IScanner, IEntryRule, IExitPolicy
 
@@ -18,52 +15,29 @@ logger = logging.getLogger("korea_market.strategy.composite")
 
 
 class CompositeStrategy(BaseStrategy):
-    """
-    Modular trading strategy composed of:
-      1. scanner : Universe screening & discovery
-      2. entry   : Signal trigger & Collar-cap pricing
-      3. exit    : Stop-loss, trailing, and liquidation policies
-    """
+    """Modular trading strategy composed of scanner, entry, and exit policy."""
 
     def __init__(
         self,
-        scanner: IScanner,
-        entry: IEntryRule,
-        exit_policy: IExitPolicy,
-        max_daily_positions: int = 1,
-        total_capital: float = 10_000_000.0,
-        dynamic_slots: bool = False,
-        base_slots: int = 2,
-        expanded_slots: int = 5,
-        kospi_gap_threshold: float = 0.0,
-        max_market_gap: Optional[float] = None,
-        severe_gap_down_filter: Optional[float] = None,
-        use_dual_index: bool = False,
-        gap_filter_index: str = "max",
-        dynamic_max_gap: bool = True,
-        bear_market_defense: bool = True,
-        regime_provider: Optional[MarketRegimeProvider] = None,
+        scanner: IScanner, entry: IEntryRule, exit_policy: IExitPolicy,
+        max_daily_positions: int = 1, total_capital: float = 10_000_000.0,
+        dynamic_slots: bool = False, base_slots: int = 2, expanded_slots: int = 5,
+        kospi_gap_threshold: float = 0.0, max_market_gap: Optional[float] = None,
+        severe_gap_down_filter: Optional[float] = None, use_dual_index: bool = False,
+        gap_filter_index: str = "max", dynamic_max_gap: bool = True,
+        bear_market_defense: bool = True, regime_provider: Optional[MarketRegimeProvider] = None,
         dynamic_feature_provider: Optional[DynamicFeatureProvider] = None,
         name: str = "composite_strategy",
     ):
-        self.scanner = scanner
-        self.entry = entry
-        self.exit_policy = exit_policy
-        self.base_max_daily_positions = max_daily_positions
-        self.max_daily_positions = max_daily_positions
-        self.total_capital = total_capital
-        self.dynamic_slots = dynamic_slots
-        self.base_slots = base_slots
-        self.expanded_slots = expanded_slots
-        self.kospi_gap_threshold = kospi_gap_threshold
-        self.max_market_gap = max_market_gap
-        self.severe_gap_down_filter = severe_gap_down_filter
-        self.use_dual_index = use_dual_index
+        self.scanner, self.entry, self.exit_policy = scanner, entry, exit_policy
+        self.base_max_daily_positions = self.max_daily_positions = max_daily_positions
+        self.total_capital, self.dynamic_slots = total_capital, dynamic_slots
+        self.base_slots, self.expanded_slots = base_slots, expanded_slots
+        self.kospi_gap_threshold, self.max_market_gap = kospi_gap_threshold, max_market_gap
+        self.severe_gap_down_filter, self.use_dual_index = severe_gap_down_filter, use_dual_index
         self.gap_filter_index = gap_filter_index.lower()
-        self.dynamic_max_gap = dynamic_max_gap
-        self.bear_market_defense = bear_market_defense
-        self.regime_provider = regime_provider
-        self.dynamic_feature_provider = dynamic_feature_provider
+        self.dynamic_max_gap, self.bear_market_defense = dynamic_max_gap, bear_market_defense
+        self.regime_provider, self.dynamic_feature_provider = regime_provider, dynamic_feature_provider
         self.name = name
 
         self.current_slot_notional: float = (total_capital / max(1, max_daily_positions)) if max_daily_positions > 0 else 0.0
@@ -166,10 +140,7 @@ class CompositeStrategy(BaseStrategy):
         # Synchronize capital with actual cash if available from context
         bal = context.get_balance() if hasattr(context, "get_balance") else None
         if bal and bal.cash > 0:
-            if bal.cash < self.total_capital:
-                self.effective_capital = bal.cash * 0.995
-            else:
-                self.effective_capital = self.total_capital
+            self.effective_capital = bal.cash * 0.995 if bal.cash < self.total_capital else self.total_capital
         else:
             self.effective_capital = getattr(self, "effective_capital", self.total_capital)
 
@@ -228,7 +199,19 @@ class CompositeStrategy(BaseStrategy):
         # Step 4: Entry Evaluation for Candidate Stocks
         if bar.symbol in self._active_candidates:
             day_open = getattr(self.scanner, "get_day_open", lambda s: None)(bar.symbol)
-            ctx_state = {"day_open": day_open} if day_open else None
+            prev_close = (
+                getattr(self.scanner, "get_prev_close", lambda s: None)(bar.symbol)
+                or getattr(self.scanner, "_day_prev_closes", {}).get(bar.symbol)
+            )
+            sc_meta = getattr(self.scanner, "get_symbol_metadata", lambda s: {})(bar.symbol) or {}
+            is_vi = bool(getattr(self.scanner, "is_vi", lambda s: False)(bar.symbol) or sc_meta.get("is_vi") or getattr(bar, "is_vi", False))
+            vi_cls = getattr(self.scanner, "get_vi_cls_code", lambda s: None)(bar.symbol) or sc_meta.get("vi_cls_code") or getattr(bar, "vi_cls_code", None)
+            ctx_state = {
+                "day_open": day_open,
+                "prev_close": prev_close,
+                "is_vi": is_vi,
+                "vi_cls_code": vi_cls,
+            }
             entry_signal = self.entry.evaluate_entry(bar.symbol, bar, context_state=ctx_state)
             if entry_signal and self.current_slot_notional > 0 and entry_signal.collar_cap_price > 0:
                 # Include slippage and commission buffer (0.5%) to guarantee execution without cash breach
@@ -284,15 +267,24 @@ class CompositeStrategy(BaseStrategy):
                     if hasattr(self.entry, "rollback_entered_symbol"):
                         self.entry.rollback_entered_symbol(event.symbol)
                 self._pending_ref_bars.pop(event.symbol, None)
-            elif event.status == OrderStatus.FILLED:
+            elif event.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
                 self._active_positions.add(event.symbol)
                 position = context.get_position(event.symbol)
                 if position:
-                    ref_bar = self._pending_ref_bars.pop(event.symbol, None)
+                    ref_bar = self._pending_ref_bars.get(event.symbol)
                     if ref_bar:
                         position.metadata.setdefault("ref_bar", ref_bar)
                         if ref_bar.get("prior_atr20_pct") is not None:
                             position.metadata.setdefault("prior_atr20_pct", ref_bar["prior_atr20_pct"])
-                    self.exit_policy.on_position_opened(position)
+                    if event.status == OrderStatus.FILLED:
+                        self._pending_ref_bars.pop(event.symbol, None)
+
+                    if position.stop_loss_price <= 0.0:
+                        self.exit_policy.on_position_opened(position)
+                    else:
+                        eff_sl = position.metadata.get("emergency_sl_pct", getattr(self.exit_policy, "emergency_sl_pct", -0.020))
+                        eff_tp = position.metadata.get("tp_target_pct", getattr(self.exit_policy, "tp_target_pct", 0.030))
+                        position.stop_loss_price = round_to_krx_tick(position.avg_price * (1.0 + eff_sl), side="SELL", round_mode="ceil")
+                        position.take_profit_price = round_to_krx_tick(position.avg_price * (1.0 + eff_tp), side="SELL", round_mode="ceil")
         elif event.side == OrderSide.SELL and event.status == OrderStatus.FILLED:
             self._active_positions.discard(event.symbol)

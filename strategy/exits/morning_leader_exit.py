@@ -81,7 +81,7 @@ class MorningLeaderExit(IExitPolicy):
         position.metadata["emergency_sl_pct"] = eff_sl
 
         raw_sl = position.avg_price * (1.0 + eff_sl)
-        position.stop_loss_price = round_to_krx_tick(raw_sl, side="SELL", round_mode="floor")
+        position.stop_loss_price = round_to_krx_tick(raw_sl, side="SELL", round_mode="ceil")
 
         raw_tp = position.avg_price * (1.0 + eff_tp)
         position.take_profit_price = round_to_krx_tick(raw_tp, side="SELL", round_mode="ceil")
@@ -237,7 +237,7 @@ class MorningLeaderExit(IExitPolicy):
                 ref_bar = position.metadata.get("ref_bar") or {}
                 if ref_bar.get("open") is not None and ref_bar.get("close") is not None:
                     ref_mid = (ref_bar["open"] + ref_bar["close"]) / 2.0
-                    center_sl = round_to_krx_tick(ref_mid, side="SELL", round_mode="floor")
+                    center_sl = round_to_krx_tick(ref_mid, side="SELL", round_mode="ceil")
                     target_sl = max(center_sl, floor_sl)
                 else:
                     target_sl = floor_sl

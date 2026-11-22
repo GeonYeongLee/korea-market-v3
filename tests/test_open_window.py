@@ -339,3 +339,157 @@ def test_kis_live_two_phase_order_idempotency():
     assert ret_id2 == ""
     assert order2.status == OrderStatus.REJECTED
     assert broker.get_position("000660") is None
+
+
+def test_composite_partial_fill_sltp_attachment_and_recalc():
+    """Verify PARTIALLY_FILLED immediately attaches SL/TP, subsequent fills adjust to new avg_price."""
+    from unittest.mock import MagicMock
+    from strategy.registry import build_strategy
+    from engine.models import OrderEvent, OrderSide, OrderStatus, Position
+
+    strat = build_strategy(scanner_name="open_window", entry_name="open_window", exit_name="trailing_lock")
+    mock_context = MagicMock()
+    pos = Position(
+        symbol="005930",
+        quantity=5,
+        avg_price=50000.0,
+        stop_loss_price=0.0,
+        take_profit_price=0.0,
+    )
+    mock_context.get_position.return_value = pos
+
+    # Partial fill event 1
+    ev1 = OrderEvent(
+        order_id="ORD1",
+        symbol="005930",
+        side=OrderSide.BUY,
+        status=OrderStatus.PARTIALLY_FILLED,
+        filled_price=50000.0,
+        filled_quantity=5,
+    )
+    strat.on_order_event(mock_context, ev1)
+    # SL and TP must be attached immediately
+    assert pos.stop_loss_price > 0.0
+    assert pos.take_profit_price > 0.0
+    old_sl = pos.stop_loss_price
+
+    # Partial fill event 2: second tranche at higher price 52,000 KRW (avg_price becomes 51,000 KRW)
+    pos.avg_price = 51000.0
+    pos.quantity = 10
+    ev2 = OrderEvent(
+        order_id="ORD1",
+        symbol="005930",
+        side=OrderSide.BUY,
+        status=OrderStatus.FILLED,
+        filled_price=52000.0,
+        filled_quantity=5,
+    )
+    strat.on_order_event(mock_context, ev2)
+    # SL must be recalculated upwards with new average price
+    assert pos.stop_loss_price > old_sl
+
+
+def test_composite_evaluate_entry_context_state_enrichment():
+    """Verify composite strategy passes is_vi, vi_cls_code, and prev_close to evaluate_entry."""
+    from unittest.mock import MagicMock
+    from strategy.registry import build_strategy
+
+    strat = build_strategy(scanner_name="open_window", entry_name="open_window", exit_name="trailing_lock")
+    mock_context = MagicMock()
+    mock_context.get_position.return_value = None
+    mock_context.get_balance.return_value = None
+
+    # Register day open, low, high, prev close (gap +2.04% within [1.5%, 8.0%]), and add candidate
+    strat.scanner._day_open_prices["005930"] = 50000.0
+    strat.scanner._day_low_prices["005930"] = 50000.0
+    strat.scanner._day_high_prices["005930"] = 50000.0
+    strat.scanner._day_prev_closes["005930"] = 49000.0
+    strat._active_candidates.add("005930")
+
+    captured_ctx = {}
+    original_eval = strat.entry.evaluate_entry
+
+    def mock_evaluate(sym, bar, context_state=None):
+        if context_state:
+            captured_ctx.update(context_state)
+        return original_eval(sym, bar, context_state=context_state)
+
+    strat.entry.evaluate_entry = mock_evaluate
+
+    bar = MinuteBar("005930", datetime(2025, 1, 15, 9, 2), 50000.0, 52000.0, 49900.0, 51500.0, 10000, 515000000.0, 515000000.0)
+    strat.on_bar(mock_context, bar)
+
+    assert "day_open" in captured_ctx
+    assert captured_ctx["day_open"] == 50000.0
+    assert "prev_close" in captured_ctx
+    assert captured_ctx["prev_close"] == 49000.0
+    assert "is_vi" in captured_ctx
+    assert "vi_cls_code" in captured_ctx
+
+
+def test_ws_client_6digit_symbol_extraction():
+    """Verify 6-digit symbol extraction extracts numeric symbol, never Korean name."""
+    import asyncio
+    from core.ws_client import KISWebSocketClient
+    client = KISWebSocketClient()
+    received_notices = []
+
+    async def mock_cb(msg_type, data):
+        if msg_type == "EXECUTION":
+            received_notices.append(data)
+
+    client.register_callback(mock_cb)
+
+    # Frame with Korean company name in field 3 and 6-digit symbol with 'A' prefix in field 7/8
+    # Format: cust_id^acct^odno^KOREAN_NAME^side^...^pdno^...
+    mock_data = "12345^01^00099^삼성전자^02^0^0^A005930^005930^10^50000^0^0^2"
+    asyncio.run(client._handle_message(f"0|H0STCNI0|001|{mock_data}"))
+
+    assert len(received_notices) == 1
+    notice = received_notices[0]
+    assert notice["symbol"] == "005930"
+    assert notice["symbol"] != "삼성전자"
+
+
+def test_rest_client_transient_5xx_retry():
+    """Verify KISRestClient retries transient 500/502/503/504 errors up to 3 times."""
+    from unittest.mock import MagicMock, patch
+    from core.rest_client import KISRestClient
+    client = KISRestClient()
+
+    attempts = 0
+
+    def mock_get(url, headers=None, params=None, timeout=10):
+        nonlocal attempts
+        attempts += 1
+        resp = MagicMock()
+        if attempts < 3:
+            resp.status_code = 502
+            resp.json.return_value = {"rt_cd": "502", "msg1": "Bad Gateway"}
+        else:
+            resp.status_code = 200
+            resp.json.return_value = {"rt_cd": "0", "msg1": "Success"}
+        return resp
+
+    with patch.object(client.session, "get", side_effect=mock_get):
+        with patch("time.sleep", return_value=None):
+            resp = client._send_request("GET", "https://api.test/test")
+            assert attempts == 3
+            assert resp.status_code == 200
+
+
+def test_morning_leader_exit_sl_ceil_rounding():
+    """Verify MorningLeaderExit uses ceil rounding for sell stop loss."""
+    from strategy.exits.morning_leader_exit import MorningLeaderExit
+    from engine.models import Position
+    from core.krx_ticks import round_to_krx_tick
+
+    exit_policy = MorningLeaderExit(emergency_sl_pct=-0.020, use_dynamic_targets=False)
+    # avg_price = 10,025 KRW -> raw_sl = 10025 * 0.98 = 9824.5 KRW
+    # Tick at 9824.5 KRW is 10 KRW.
+    # Floor rounding would be 9,820 KRW. Ceil rounding must be 9,830 KRW!
+    pos = Position(symbol="005930", quantity=10, avg_price=10025.0)
+    exit_policy.on_position_opened(pos)
+
+    assert pos.stop_loss_price == 9830
+    assert pos.stop_loss_price == round_to_krx_tick(10025.0 * 0.98, side="SELL", round_mode="ceil")

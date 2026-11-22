@@ -130,6 +130,14 @@ class OpenWindowScanner(IScanner):
         """Returns registered day open price for symbol."""
         return self._day_open_prices.get(symbol)
 
+    def get_prev_close(self, symbol: str) -> Optional[float]:
+        """Returns registered previous close price for symbol."""
+        return self._day_prev_closes.get(symbol)
+
+    def get_symbol_metadata(self, symbol: str) -> Dict[str, Any]:
+        """Returns symbol metadata dictionary if present."""
+        return getattr(self, "_symbol_metadata", {}).get(symbol, {})
+
     def get_allocated_slots(self) -> int:
         """Returns current dynamic slot allocation count."""
         return self.allocated_slots
@@ -202,8 +210,8 @@ class OpenWindowScanner(IScanner):
                 self._day_low_prices[bar.symbol] = bar.low
                 self._day_high_prices[bar.symbol] = bar.high
             else:
-                self._day_low_prices[bar.symbol] = min(self._day_low_prices[bar.symbol], bar.low)
-                self._day_high_prices[bar.symbol] = max(self._day_high_prices[bar.symbol], bar.high)
+                self._day_low_prices[bar.symbol] = min(self._day_low_prices.get(bar.symbol, bar.low), bar.low)
+                self._day_high_prices[bar.symbol] = max(self._day_high_prices.get(bar.symbol, bar.high), bar.high)
 
         # 3. Time window evaluation guard
         if bar.time < self.start_time or bar.time > self.end_time:

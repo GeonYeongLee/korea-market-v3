@@ -313,14 +313,26 @@ class KISWebSocketClient:
                     return
 
             fields = data_str.split("^")
+            sym = ""
+            for idx in (7, 8, 3):
+                if idx < len(fields):
+                    c = fields[idx].strip().lstrip("A")
+                    if len(c) == 6 and c.isdigit():
+                        sym = c
+                        break
+            if not sym:
+                for c_raw in fields:
+                    c = c_raw.strip().lstrip("A")
+                    if len(c) == 6 and c.isdigit():
+                        sym = c
+                        break
+
             if len(fields) >= 14:
                 cntg_yn = fields[13]
                 # 1 = 주문/접수/취소 통보, 2 = 체결 통보
                 if cntg_yn != "2":
                     logger.info(f"Order receipt/update notice: order_no={fields[2]}, status={cntg_yn}")
                     return
-                raw_sym = fields[8] if len(fields[8]) in (6, 7) else (fields[7] if len(fields) > 7 and len(fields[7]) in (6, 7) else fields[3])
-                sym = raw_sym.lstrip("A") if len(raw_sym) == 7 and raw_sym.startswith("A") else raw_sym
                 exec_notice = {
                     "account_no": fields[1],
                     "order_no": fields[2],
@@ -330,8 +342,6 @@ class KISWebSocketClient:
                     "price": float(fields[10]) if fields[10].replace(".", "", 1).isdigit() else 0.0,
                 }
             else:
-                raw_sym = fields[3] if len(fields) > 3 else ""
-                sym = raw_sym.lstrip("A") if len(raw_sym) == 7 and raw_sym.startswith("A") else raw_sym
                 exec_notice = {
                     "account_no": fields[0] if len(fields) > 0 else "",
                     "order_no": fields[1] if len(fields) > 1 else "",
