@@ -65,6 +65,7 @@ def build_strategy(
     exit_flag = dynamic if dynamic_exit_targets is None else dynamic_exit_targets
     gap_flag = dynamic if dynamic_max_gap is None else dynamic_max_gap
     bear_flag = dynamic if bear_market_defense is None else bear_market_defense
+    severe_flag = -2.0 if (dynamic and severe_gap_down_filter is None) else severe_gap_down_filter
 
     s_kwargs = (scanner_kwargs or {}).copy()
     if "use_dynamic_turnover" not in s_kwargs and scanner_name == "morning_leader":
@@ -95,7 +96,7 @@ def build_strategy(
         expanded_slots=expanded_slots,
         kospi_gap_threshold=kospi_gap_threshold,
         max_market_gap=max_market_gap,
-        severe_gap_down_filter=severe_gap_down_filter,
+        severe_gap_down_filter=severe_flag,
         use_dual_index=use_dual_index,
         gap_filter_index=gap_filter_index,
         dynamic_max_gap=gap_flag,

@@ -30,9 +30,9 @@ class SymbolDynamicFeatures:
 class IndexDynamicFeatures:
     ks_trend: float
     kq_trend: float
-    market_gap_std20: float
-    is_bear_market: bool
-    dynamic_max_gap: float
+    market_gap_std20: float = DEFAULT_MARKET_GAP_STD
+    is_bear_market: bool = False
+    dynamic_max_gap: float = DEFAULT_MARKET_GAP_STD
 
 
 class DynamicFeatureProvider:
@@ -62,7 +62,10 @@ class DynamicFeatureProvider:
     def _to_date_str(d: object) -> str:
         if hasattr(d, "strftime"):
             return d.strftime("%Y-%m-%d")
-        return str(d)[:10]
+        s = str(d).strip()
+        if len(s) == 8 and s.isdigit():
+            return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        return s[:10]
 
     def load(self) -> None:
         """Precomputes and caches all dynamic features with strict shift(1) lookahead guard."""
@@ -81,7 +84,7 @@ class DynamicFeatureProvider:
         try:
             cols = ["date", "symbol", "high", "low", "close", "prev_close", "turnover", "adto20"]
             df = pd.read_parquet(self.daily_file, columns=cols)
-            df["date_str"] = df["date"].astype(str)
+            df["date_str"] = df["date"].map(self._to_date_str)
             df = df.sort_values(["symbol", "date_str"]).reset_index(drop=True)
 
             # True Range: max(H-L, |H-PC|, |L-PC|)
@@ -127,7 +130,7 @@ class DynamicFeatureProvider:
                 )
                 return
 
-            df_idx["date_str"] = pd.to_datetime(df_idx["date"]).dt.strftime("%Y-%m-%d")
+            df_idx["date_str"] = df_idx["date"].map(self._to_date_str)
             df_idx = df_idx.sort_values("date_str").reset_index(drop=True)
             if df_idx.empty:
                 return
@@ -207,6 +210,33 @@ class DynamicFeatureProvider:
             market_gap_std20=DEFAULT_MARKET_GAP_STD,
             is_bear_market=False,
             dynamic_max_gap=DEFAULT_MARKET_GAP_STD,
+        )
+
+    def register_live_index_features(
+        self,
+        current_date: date | str,
+        ks_trend: float,
+        kq_trend: float,
+        is_bear_market: bool,
+        dynamic_max_gap: float,
+        market_gap_std20: float = DEFAULT_MARKET_GAP_STD,
+    ) -> None:
+        """Registers real-time index dynamic features computed at market open."""
+        if not self._is_loaded:
+            self.load()
+        d_str = self._to_date_str(current_date)
+        self._index_features_by_date[d_str] = IndexDynamicFeatures(
+            ks_trend=float(ks_trend),
+            kq_trend=float(kq_trend),
+            market_gap_std20=float(market_gap_std20),
+            is_bear_market=bool(is_bear_market),
+            dynamic_max_gap=float(dynamic_max_gap),
+        )
+        if self._latest_index_date is None or d_str > self._latest_index_date:
+            self._latest_index_date = d_str
+        logger.info(
+            f"Registered live index features for {d_str}: KS trend {ks_trend:+.2%}, KQ trend {kq_trend:+.2%}, "
+            f"bear_market={is_bear_market}, dynamic_max_gap={dynamic_max_gap:.2f}%"
         )
 
 

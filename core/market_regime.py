@@ -14,6 +14,15 @@ import pandas as pd
 logger = logging.getLogger("korea_market.core.market_regime")
 
 
+def _normalize_date(d: date | str) -> str:
+    if hasattr(d, "strftime"):
+        return d.strftime("%Y-%m-%d")
+    s = str(d).strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s[:10]
+
+
 class MarketRegimeProvider:
     """
     Caches and serves KOSPI and KOSDAQ gap % and market breadth indicators.
@@ -42,7 +51,7 @@ class MarketRegimeProvider:
                 cols = ["date", "ks_gap_pct", "kq_gap_pct"]
                 df_idx = pd.read_parquet(self.index_file, columns=cols)
                 for _, r in df_idx.iterrows():
-                    d_str = str(pd.Timestamp(r["date"]).date())
+                    d_str = _normalize_date(r["date"])
                     if pd.notna(r.get("ks_gap_pct")):
                         self._kospi_gap_cache[d_str] = float(r["ks_gap_pct"])
                     if pd.notna(r.get("kq_gap_pct")):
@@ -59,7 +68,7 @@ class MarketRegimeProvider:
                         market_map = json.load(f)
 
                 df_daily = pd.read_parquet(self.daily_file, columns=["date", "symbol", "open", "prev_close", "adto20"])
-                df_daily["d_str"] = df_daily["date"].astype(str)
+                df_daily["d_str"] = df_daily["date"].map(_normalize_date)
                 all_dates = set(df_daily["d_str"].unique())
                 missing_dates = all_dates - (set(self._kospi_gap_cache.keys()) & set(self._kosdaq_gap_cache.keys()))
                 if missing_dates:
@@ -91,32 +100,43 @@ class MarketRegimeProvider:
 
         self._is_loaded = True
 
-    def get_kospi_gap(self, current_date: date) -> Optional[float]:
+    def register_live_regime(self, current_date: date | str, ks_gap: float, kq_gap: float) -> None:
+        """Register live real-time KOSPI & KOSDAQ gap % calculated at 09:00:00."""
         self._load_cache()
-        d_str = str(current_date)
+        d_str = _normalize_date(current_date)
+        self._kospi_gap_cache[d_str] = float(ks_gap)
+        self._kosdaq_gap_cache[d_str] = float(kq_gap)
+        logger.info(f"Registered live market regime for {d_str}: KOSPI gap {ks_gap:+.2f}%, KOSDAQ gap {kq_gap:+.2f}%")
+
+    def get_kospi_gap(self, current_date: date | str) -> Optional[float]:
+        self._load_cache()
+        d_str = _normalize_date(current_date)
         return self._kospi_gap_cache.get(d_str)
 
-    def get_kosdaq_gap(self, current_date: date) -> Optional[float]:
+    def get_kosdaq_gap(self, current_date: date | str) -> Optional[float]:
         self._load_cache()
-        d_str = str(current_date)
+        d_str = _normalize_date(current_date)
         return self._kosdaq_gap_cache.get(d_str)
 
-    def get_max_gap(self, current_date: date) -> Optional[float]:
-        ks = self.get_kospi_gap(current_date)
-        kq = self.get_kosdaq_gap(current_date)
+    def get_max_gap(self, current_date: date | str) -> Optional[float]:
+        d_str = _normalize_date(current_date)
+        ks = self.get_kospi_gap(d_str)
+        kq = self.get_kosdaq_gap(d_str)
         if ks is not None and kq is not None:
             return max(ks, kq)
         return ks if ks is not None else kq
 
-    def get_min_gap(self, current_date: date) -> Optional[float]:
-        ks = self.get_kospi_gap(current_date)
-        kq = self.get_kosdaq_gap(current_date)
+    def get_min_gap(self, current_date: date | str) -> Optional[float]:
+        d_str = _normalize_date(current_date)
+        ks = self.get_kospi_gap(d_str)
+        kq = self.get_kosdaq_gap(d_str)
         if ks is not None and kq is not None:
             return min(ks, kq)
         return ks if ks is not None else kq
 
-    def get_dual_regime(self, current_date: date) -> Tuple[Optional[float], Optional[float]]:
-        return self.get_kospi_gap(current_date), self.get_kosdaq_gap(current_date)
+    def get_dual_regime(self, current_date: date | str) -> Tuple[Optional[float], Optional[float]]:
+        d_str = _normalize_date(current_date)
+        return self.get_kospi_gap(d_str), self.get_kosdaq_gap(d_str)
 
 
 _default_provider: Optional[MarketRegimeProvider] = None

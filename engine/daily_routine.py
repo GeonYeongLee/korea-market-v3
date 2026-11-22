@@ -84,6 +84,11 @@ class DailyRoutineOrchestrator:
             if len(self.target_date) == 8
             else self.target_date
         )
+        target_date_obj = (
+            datetime.strptime(self.target_date, "%Y%m%d").date()
+            if len(self.target_date) == 8
+            else date.fromisoformat(self.target_date)
+        )
 
         cutoff_t = getattr(self.strategy, "cutoff_time", dtime(9, 25, 0))
         cutoff_str = cutoff_t.strftime("%H:%M")
@@ -101,10 +106,10 @@ class DailyRoutineOrchestrator:
         # =====================================================================
         env_mode = "vts" if self.mode == "mock" else "real"
         cfg = settings.switch_env(env_mode)
-        stage1_broker = KisLiveBroker(mode=env_mode, cfg=cfg)
+        broker = KisLiveBroker(mode=env_mode, cfg=cfg)
         try:
-            stage1_broker.sync_account_state()
-            bal = stage1_broker.get_balance()
+            broker.sync_account_state()
+            bal = broker.get_balance()
             if bal and bal.cash > 0:
                 if bal.cash < self.capital:
                     console.print(
@@ -133,28 +138,94 @@ class DailyRoutineOrchestrator:
                 time.sleep(max(0, sec_to_wait + 1))
 
         # =====================================================================
+        # [STAGE 1.5] 09:00:01 실시간 시장 레짐 산출 & 라이프사이클 100% 확정
+        # =====================================================================
+        console.print("[cyan]🔍 [09:00:01] KOSPI/KOSDAQ 실시간 갭률 및 시장 레짐(20MA 괴리율/동적 갭) 산출 중...[/cyan]")
+        regime_data = broker.client.get_kospi_gap_and_market_regime()
+        ks_gap = float(regime_data.get("ks_gap_pct", regime_data.get("kospi_gap_pct", 0.0)))
+        kq_gap = float(regime_data.get("kq_gap_pct", regime_data.get("kosdaq_gap_pct", 0.0)))
+        ks_trend = float(regime_data.get("ks_trend", 0.0))
+        kq_trend = float(regime_data.get("kq_trend", 0.0))
+        is_bear = bool(regime_data.get("is_bear_market", False))
+        dynamic_max_gap = float(regime_data.get("dynamic_max_gap", 0.75))
+        gap_std = float(regime_data.get("gap_std", 0.65))
+
+        from core.market_regime import get_default_market_regime_provider
+        from core.dynamic_features import get_default_dynamic_feature_provider
+
+        regime_provider = getattr(self.strategy, "regime_provider", None) or get_default_market_regime_provider()
+        dyn_provider = getattr(self.strategy, "dynamic_feature_provider", None) or get_default_dynamic_feature_provider()
+
+        regime_provider.register_live_regime(current_date=target_date_obj, ks_gap=ks_gap, kq_gap=kq_gap)
+        dyn_provider.register_live_index_features(
+            current_date=target_date_obj,
+            ks_trend=ks_trend,
+            kq_trend=kq_trend,
+            is_bear_market=is_bear,
+            dynamic_max_gap=dynamic_max_gap,
+            market_gap_std20=gap_std,
+        )
+
+        clock = RealtimeClock()
+        risk_manager = RiskManager()
+        from core.ws_client import KISWebSocketClient
+        ws_client = KISWebSocketClient(cfg)
+        datafeed = KisRealtimeFeed(ws_client=ws_client, broker=broker)
+        datafeed.execution_callback = broker.handle_execution_notice
+
+        engine = TradingEngine(
+            strategy=self.strategy,
+            broker=broker,
+            feed=datafeed,
+            clock=clock,
+            risk_manager=risk_manager,
+        )
+
+        # 09:00:01 스캐너 가동 및 틱 수신 전에 전략 라이프사이클 명시적 호출
+        self.strategy.on_day_open(engine.context, target_date_obj)
+        engine._current_date = target_date_obj
+
+        max_slots = self.strategy.max_daily_positions
+        slot_notional = getattr(self.strategy, "current_slot_notional", 0.0)
+
+        console.print(Panel.fit(
+            f"[bold cyan]🧭 [09:00:01 MARKET REGIME 확정][/bold cyan]\n"
+            f"• [bold]KOSPI 갭률[/bold]: {ks_gap:+.2f}% | [bold]KOSDAQ 갭률[/bold]: {kq_gap:+.2f}%\n"
+            f"• [bold]20MA 괴리율[/bold]: KOSPI {ks_trend:+.2%}, KOSDAQ {kq_trend:+.2%}\n"
+            f"• [bold]하락장 방어(Bear Market)[/bold]: {'[bold red]ACTIVE (하락장 감지)[/bold red]' if is_bear else '[green]INACTIVE (정상 시장)[/green]'}\n"
+            f"• [bold]동적 갭 한도[/bold]: {dynamic_max_gap:.2f}% (지수 20일 변동성: {gap_std:.2f}%)\n"
+            f"• [bold]당일 운용 슬롯[/bold]: [bold yellow]{max_slots}슬롯[/bold yellow] ({slot_notional:,.0f}원/슬롯)",
+            border_style="magenta" if max_slots == 0 else "cyan",
+        ))
+        logger.info(
+            f"09:00:01 Regime finalized: KS_gap={ks_gap:+.2f}%, KQ_gap={kq_gap:+.2f}%, "
+            f"KS_trend={ks_trend:+.2%}, KQ_trend={kq_trend:+.2%}, bear={is_bear}, "
+            f"max_gap={dynamic_max_gap:.2f}%, slots={max_slots}, slot_notional={slot_notional:,.0f}"
+        )
+
+        # =====================================================================
         # [STAGE 2 & 3] 09:00 ~ {cutoff_str} 실시간 스캐너 발굴 & 돌파 매수/청산 관리
         # =====================================================================
         should_skip_trading = False
         now = datetime.now()
-        if now.time() >= cutoff_t:
-            env_mode = "vts" if self.mode == "mock" else "real"
-            cfg = settings.switch_env(env_mode)
-            check_broker = KisLiveBroker(mode=env_mode, cfg=cfg)
-            try:
-                check_broker.sync_account_state()
-            except Exception as e:
-                logger.debug(f"Could not query account state on late start: {e}")
+        open_pos = broker.get_positions()
 
-            open_pos = check_broker.get_positions()
-            if not open_pos:
-                should_skip_trading = True
-                console.print(Panel.fit(
-                    f"[bold yellow]⏭️ [STAGE 2 & 3 건너뜀] 당일 아침 주도주 진입 시간(09:00~{cutoff_str})이 이미 종료되었습니다.[/bold yellow]\n"
-                    f"[cyan]현재 시각:[/cyan] {now.strftime('%H:%M:%S')} (진입 마감 시각: {cutoff_str}) | [cyan]보유 잔고:[/cyan] 0종목\n"
-                    f"[green]✓ 신규 매매를 건너뛰고 대사(Reconciliation) 단계로 이동합니다.[/green]",
-                    border_style="yellow"
-                ))
+        if now.time() >= cutoff_t and not open_pos:
+            should_skip_trading = True
+            console.print(Panel.fit(
+                f"[bold yellow]⏭️ [STAGE 2 & 3 건너뜀] 당일 아침 주도주 진입 시간(09:00~{cutoff_str})이 이미 종료되었습니다.[/bold yellow]\n"
+                f"[cyan]현재 시각:[/cyan] {now.strftime('%H:%M:%S')} (진입 마감 시각: {cutoff_str}) | [cyan]보유 잔고:[/cyan] 0종목\n"
+                f"[green]✓ 신규 매매를 건너뛰고 대사(Reconciliation) 단계로 이동합니다.[/green]",
+                border_style="yellow"
+            ))
+        elif max_slots == 0 and not open_pos:
+            should_skip_trading = True
+            console.print(Panel.fit(
+                f"[bold red]🛡️ [TRADING BLOCKED] 시장 위험 또는 하락장 방어 필터 발동으로 당일 매매가 0슬롯으로 차단되었습니다.[/bold red]\n"
+                f"[yellow]• 사유: 하락장 레짐(MA20 이탈) 또는 극단적 갭(동적 갭 한도 초과/극단적 갭하락)[/yellow]\n"
+                f"[green]✓ 불필요한 스캐너 폴링을 건너뛰고 자금을 100% 안전 보존(Safe Observation Mode)합니다.[/green]",
+                border_style="red"
+            ))
 
         if not should_skip_trading:
             console.print(Panel.fit(
@@ -167,24 +238,6 @@ class DailyRoutineOrchestrator:
                 border_style="cyan"
             ))
 
-            env_mode = "vts" if self.mode == "mock" else "real"
-            cfg = settings.switch_env(env_mode)
-            broker = KisLiveBroker(mode=env_mode, cfg=cfg)
-            clock = RealtimeClock()
-            risk_manager = RiskManager()
-
-            from core.ws_client import KISWebSocketClient
-            ws_client = KISWebSocketClient(cfg)
-            datafeed = KisRealtimeFeed(ws_client=ws_client, broker=broker)
-            datafeed.execution_callback = broker.handle_execution_notice
-
-            engine = TradingEngine(
-                strategy=self.strategy,
-                broker=broker,
-                feed=datafeed,
-                clock=clock,
-                risk_manager=risk_manager,
-            )
             scanner = RealtimeLeaderScanner(
                 client=broker.client,
                 datafeed=datafeed,
@@ -193,11 +246,8 @@ class DailyRoutineOrchestrator:
             )
 
             try:
-                broker.sync_account_state()
-                bal = broker.get_balance()
-                if bal and bal.cash > 0 and hasattr(self.strategy, "sync_capital_with_balance"):
-                    self.strategy.sync_capital_with_balance(bal.cash)
-                scanner.start()
+                if max_slots > 0:
+                    scanner.start()
                 datafeed.start()
 
                 engine_thread = threading.Thread(target=engine.run, daemon=True, name="TradingEngineThread")
@@ -255,7 +305,8 @@ class DailyRoutineOrchestrator:
                 console.print("[bold yellow]🔒 [STAGE 4] 스캐너 정지, 웹소켓 연결 해제 및 잔여 주문 정리 중...[/bold yellow]")
                 try:
                     broker.cancel_pending_orders()
-                    scanner.stop()
+                    if max_slots > 0:
+                        scanner.stop()
                     datafeed.stop()
                 except Exception as e:
                     logger.debug(f"Error stopping feeds/cancelling orders: {e}")

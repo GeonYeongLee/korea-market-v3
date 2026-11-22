@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 import requests
 from requests.adapters import HTTPAdapter
+import numpy as np
 
 from config.settings import Settings, settings
 from core.auth import TokenManager
@@ -193,10 +194,10 @@ class KISRestClient:
             code = it.get("mksc_shrn_iscd") or it.get("stck_shrn_iscd")
             if not code:
                 continue
-            to = float(it.get("acml_tr_pbmn", 0))
+            to = float(it.get("acml_tr_pbmn") or 0.0)
             if to < 100_000_000:
                 to *= 1_000_000.0
-            vol = int(it.get("acml_vol", 0))
+            vol = int(it.get("acml_vol") or 0)
             item_copy = dict(it)
             item_copy["_krx_to"] = to
             item_copy["_nxt_to"] = 0.0
@@ -209,10 +210,10 @@ class KISRestClient:
             code = it.get("mksc_shrn_iscd") or it.get("stck_shrn_iscd")
             if not code:
                 continue
-            to = float(it.get("acml_tr_pbmn", 0))
+            to = float(it.get("acml_tr_pbmn") or 0.0)
             if to < 100_000_000:
                 to *= 1_000_000.0
-            vol = int(it.get("acml_vol", 0))
+            vol = int(it.get("acml_vol") or 0)
             if code in merged:
                 merged[code]["_nxt_to"] = to
                 merged[code]["_tot_to"] += to
@@ -652,107 +653,178 @@ class KISRestClient:
     def get_kospi_gap_and_market_regime(self) -> Dict[str, Any]:
         """
         국내업종 일별 지수 시세 조회 (TR: FHKUP03500100).
-        09:00:01에 KOSPI(0001) 및 KOSDAQ(1001) 전일 종가, 당일 시가 및 갭률(%)과 5일선 추세를 병렬 조회합니다.
+        09:00:01에 KOSPI(0001) 및 KOSDAQ(1001) 최근 25거래일 일봉을 조회하여
+        당일 09:00 시초가 갭률, t-1 종가 기준 20MA 괴리율(추세), 하락장 플래그 및 동적 갭 한도를 산출합니다.
 
-        규칙 [5일선 추세 결합]:
-        - (KOSPI > 5MA OR KOSDAQ > 5MA) AND KOSDAQ 갭 >= 0.0%: 5슬롯 확장 (BULL)
-        - 그 외: 3슬롯 방어 (BEAR/DEFENSIVE)
+        규칙:
+        - 20일선 괴리율: ks_trend = (ks_prev_close - ks_ma20) / ks_ma20, kq_trend = (kq_prev_close - kq_ma20) / kq_ma20
+        - 하락장 방어: is_bear_market = (ks_trend < 0.0) and (kq_trend < 0.0)
+        - 갭률(%): ks_gap_pct = (ks_open - ks_prev_close) / ks_prev_close * 100
+        - 최근 20일 지수 갭률 표준편차: gap_std (부족시 기본값 0.65%)
+        - 동적 갭 한도: dynamic_max_gap = float(np.clip(1.0 * gap_std, 0.50, 1.75))
 
         Returns:
             Dict containing:
-                - "kospi_gap_pct": float
-                - "kosdaq_gap_pct": float
+                - "kospi_gap_pct", "kosdaq_gap_pct", "ks_gap_pct", "kq_gap_pct": float
+                - "ks_prev_close", "ks_open", "kq_prev_close", "kq_open": float
+                - "ks_ma20", "kq_ma20": float
+                - "ks_trend", "kq_trend": float
+                - "is_bear_market": bool
+                - "gap_std": float
+                - "dynamic_max_gap": float
                 - "is_both_gap_up": bool
-                - "ks_above_5ma": bool
-                - "kq_above_5ma": bool
-                - "is_trend_bull": bool
                 - "regime": str ("BULL" or "BEAR")
-                - "max_slots": int (5 if BULL else 3)
+                - "max_slots", "slots": int (0 if is_bear_market else 5)
                 - "adr_pct": float
+                - "error": Optional[str]
         """
         today_str = datetime.now().strftime("%Y%m%d")
-        start_str = (datetime.now() - timedelta(days=25)).strftime("%Y%m%d")
+        start_str = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
         tr_id = "FHKUP03500100"
 
-        def _fetch_index(iscd: str) -> tuple[float, float, float, float, float, bool]:
-            self.limiter.acquire_sync()
-            headers = self._get_headers(tr_id)
-            params = {
-                "FID_COND_MRKT_DIV_CODE": "U",
-                "FID_INPUT_ISCD": iscd,
-                "FID_INPUT_DATE_1": start_str,
-                "FID_INPUT_DATE_2": today_str,
-                "FID_PERIOD_DIV_CODE": "D",
-            }
-            resp = self._send_request("GET", url, headers=headers, params=params, timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("rt_cd") != "0":
-                return -999.0, 0.0, 0.0, 50.0, 0.0, False
-            out1 = data.get("output1", {})
-            out2 = data.get("output2", [])
+        def _fetch_index(iscd: str):
+            today_open = 0.0
+            out1 = {}
+            out2 = []
+            today_bar = None
+            hist_bars = []
 
-            # Check if out2[0] represents today or previous business day
-            if out2 and out2[0].get("stck_bsop_date") == today_str:
-                today_open = float(out2[0].get("bstp_nmix_oprc") or out1.get("bstp_nmix_oprc") or 0.0)
-                past_closes = [float(x.get("bstp_nmix_prpr", 0.0)) for x in out2[1:6] if x.get("bstp_nmix_prpr")]
-                prev_close = past_closes[0] if past_closes else float(out1.get("prdy_nmix", 0.0) or 0.0)
-            else:
-                today_open = float(out1.get("bstp_nmix_oprc") or (out2[0].get("bstp_nmix_oprc") if out2 else 0.0))
-                past_closes = [float(x.get("bstp_nmix_prpr", 0.0)) for x in out2[:5] if x.get("bstp_nmix_prpr")]
-                prev_close = past_closes[0] if past_closes else float(out1.get("prdy_nmix", 0.0) or 0.0)
+            for attempt in range(3):
+                self.limiter.acquire_sync()
+                headers = self._get_headers(tr_id)
+                params = {
+                    "FID_COND_MRKT_DIV_CODE": "U",
+                    "FID_INPUT_ISCD": iscd,
+                    "FID_INPUT_DATE_1": start_str,
+                    "FID_INPUT_DATE_2": today_str,
+                    "FID_PERIOD_DIV_CODE": "D",
+                }
+                resp = self._send_request("GET", url, headers=headers, params=params, timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("rt_cd") != "0":
+                    raise RuntimeError(f"API Error {data.get('msg_cd')}: {data.get('msg1')}")
+                out1 = data.get("output1") or {}
+                out2 = data.get("output2") or []
 
-            ascn = float(out1.get("ascn_issu_cnt", 0.0) or 0.0)
-            down = float(out1.get("down_issu_cnt", 0.0) or 0.0)
+                today_bar = None
+                hist_bars = []
+                if out2:
+                    if out2[0].get("stck_bsop_date") == today_str:
+                        today_bar = out2[0]
+                        hist_bars = out2[1:]
+                    else:
+                        hist_bars = out2
+
+                t_op = float(today_bar.get("bstp_nmix_oprc") or 0.0) if today_bar else 0.0
+                o1_op = float(out1.get("bstp_nmix_oprc") or 0.0)
+                today_open = t_op if t_op > 0 else o1_op
+                if today_open > 0 or attempt == 2:
+                    break
+                logger.info(f"Open price for index {iscd} is 0.0 at attempt {attempt + 1}/3, retrying in 0.5s...")
+                time.sleep(0.5)
+
+            h_pc = float(hist_bars[0].get("bstp_nmix_prpr") or 0.0) if hist_bars else 0.0
+            o1_pc = float(out1.get("prdy_nmix") or 0.0)
+            prev_close = h_pc if h_pc > 0 else o1_pc
+
+            gap_pct = ((today_open - prev_close) / prev_close * 100.0) if (prev_close > 0 and today_open > 0) else 0.0
+
+            past_closes = [
+                float(x.get("bstp_nmix_prpr") or 0.0)
+                for x in hist_bars
+                if float(x.get("bstp_nmix_prpr") or 0.0) > 0
+            ]
+            closes_20 = past_closes[:20]
+            ma20 = (sum(closes_20) / len(closes_20)) if len(closes_20) >= 5 else (prev_close if prev_close > 0 else 0.0)
+            trend = ((prev_close - ma20) / ma20) if ma20 > 0 else 0.0
+
+            hist_gaps = []
+            for i in range(min(20, len(hist_bars) - 1)):
+                b_op = float(hist_bars[i].get("bstp_nmix_oprc") or 0.0)
+                b_pc = float(hist_bars[i + 1].get("bstp_nmix_prpr") or 0.0)
+                if b_op > 0 and b_pc > 0:
+                    hist_gaps.append((b_op - b_pc) / b_pc * 100.0)
+
+            ascn = float(out1.get("ascn_issu_cnt") or 0.0)
+            down = float(out1.get("down_issu_cnt") or 0.0)
             adr = (ascn / (ascn + down) * 100.0) if (ascn + down) > 0 else 50.0
 
-            if prev_close > 0 and today_open > 0:
-                gap = ((today_open - prev_close) / prev_close * 100.0)
-            else:
-                gap = -999.0
-
-            ma5 = (sum(past_closes) / len(past_closes)) if len(past_closes) >= 5 else (prev_close if prev_close > 0 else 0.0)
-            above_5ma = (prev_close >= ma5) or (today_open >= ma5 if today_open > 0 else False)
-            return gap, prev_close, today_open, adr, ma5, above_5ma
+            return gap_pct, prev_close, today_open, ma20, trend, hist_gaps, adr, len(past_closes)
 
         try:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=2) as executor:
                 f_ks = executor.submit(_fetch_index, "0001")
                 f_kq = executor.submit(_fetch_index, "1001")
-                ks_gap, ks_prev, ks_open, ks_adr, ks_ma5, ks_above = f_ks.result(timeout=6)
+                ks_gap, ks_prev, ks_open, ks_ma20, ks_trend, ks_hist_gaps, ks_adr, ks_bars = f_ks.result(timeout=10)
                 try:
-                    kq_gap, kq_prev, kq_open, kq_adr, kq_ma5, kq_above = f_kq.result(timeout=6)
+                    kq_gap, kq_prev, kq_open, kq_ma20, kq_trend, kq_hist_gaps, kq_adr, kq_bars = f_kq.result(timeout=10)
                 except Exception as e_kq:
-                    logger.warning(f"Could not fetch KOSDAQ index, using KOSPI gap fallback: {e_kq}")
-                    kq_gap = ks_gap
-                    kq_adr = ks_adr
-                    kq_ma5 = ks_ma5
-                    kq_above = ks_above
+                    logger.warning(f"Could not fetch KOSDAQ index, using KOSPI fallback: {e_kq}")
+                    kq_gap, kq_prev, kq_open, kq_ma20, kq_trend, kq_hist_gaps, kq_adr, kq_bars = (
+                        ks_gap, ks_prev, ks_open, ks_ma20, ks_trend, ks_hist_gaps, ks_adr, ks_bars
+                    )
 
-            ks_gap_val = ks_gap if ks_gap != -999.0 else 0.0
-            kq_gap_val = kq_gap if kq_gap != -999.0 else 0.0
+            if len(ks_hist_gaps) >= 5:
+                gap_std = float(np.std(ks_hist_gaps, ddof=1))
+            else:
+                gap_std = 0.65
+            if not np.isfinite(gap_std) or gap_std <= 0:
+                gap_std = 0.65
+
+            dynamic_max_gap = float(np.clip(1.0 * gap_std, 0.50, 1.75))
+
+            data_abnormal = (
+                ks_prev <= 0
+                or kq_prev <= 0
+                or ks_ma20 <= 0
+                or kq_ma20 <= 0
+                or ks_bars < 5
+                or kq_bars < 5
+            )
+
+            if data_abnormal:
+                logger.warning(
+                    f"Abnormal or insufficient market index data detected "
+                    f"(ks_prev={ks_prev}, kq_prev={kq_prev}, ks_ma20={ks_ma20}, kq_ma20={kq_ma20}, "
+                    f"ks_bars={ks_bars}, kq_bars={kq_bars}). Applying conservative Fail-Safe (BEAR / 0 slots)."
+                )
+                is_bear_market = True
+                regime = "BEAR"
+                max_slots = 0
+                slots = 0
+            else:
+                is_bear_market = (ks_trend < 0.0) and (kq_trend < 0.0)
+                regime = "BEAR" if is_bear_market else "BULL"
+                max_slots = 0 if is_bear_market else 5
+                slots = max_slots
 
             is_both_gap_up = (ks_gap >= 0.0 and kq_gap >= 0.0)
-            is_trend_bull = (ks_above or kq_above) and (kq_gap >= 0.0)
-            regime = "BULL" if is_trend_bull else "BEAR"
-            max_slots = 5 if is_trend_bull else 3
 
             result = {
-                "kospi_gap_pct": round(ks_gap_val, 4),
-                "kosdaq_gap_pct": round(kq_gap_val, 4),
-                "ks_above_5ma": ks_above,
-                "kq_above_5ma": kq_above,
-                "ks_ma5": round(ks_ma5, 2),
-                "kq_ma5": round(kq_ma5, 2),
+                "kospi_gap_pct": round(ks_gap, 4),
+                "kosdaq_gap_pct": round(kq_gap, 4),
+                "ks_gap_pct": round(ks_gap, 4),
+                "kq_gap_pct": round(kq_gap, 4),
+                "ks_prev_close": ks_prev,
+                "ks_open": ks_open,
+                "kq_prev_close": kq_prev,
+                "kq_open": kq_open,
+                "ks_ma20": round(ks_ma20, 2),
+                "kq_ma20": round(kq_ma20, 2),
+                "ks_trend": round(ks_trend, 6),
+                "kq_trend": round(kq_trend, 6),
+                "is_bear_market": is_bear_market,
+                "gap_std": round(gap_std, 4),
+                "dynamic_max_gap": round(dynamic_max_gap, 4),
                 "is_both_gap_up": is_both_gap_up,
-                "is_trend_bull": is_trend_bull,
-                "prev_close": ks_prev,
-                "today_open": ks_open,
                 "regime": regime,
                 "max_slots": max_slots,
+                "slots": slots,
                 "adr_pct": round(ks_adr, 2),
+                "error": None,
             }
 
             return result
@@ -761,11 +833,23 @@ class KISRestClient:
             return {
                 "kospi_gap_pct": 0.0,
                 "kosdaq_gap_pct": 0.0,
-                "ks_above_5ma": False,
-                "kq_above_5ma": False,
+                "ks_gap_pct": 0.0,
+                "kq_gap_pct": 0.0,
+                "ks_prev_close": 0.0,
+                "ks_open": 0.0,
+                "kq_prev_close": 0.0,
+                "kq_open": 0.0,
+                "ks_ma20": 0.0,
+                "kq_ma20": 0.0,
+                "ks_trend": -0.05,
+                "kq_trend": -0.05,
+                "is_bear_market": True,
+                "gap_std": 0.65,
+                "dynamic_max_gap": 0.65,
                 "is_both_gap_up": False,
-                "is_trend_bull": False,
                 "regime": "BEAR",
-                "max_slots": 3,
+                "max_slots": 0,
+                "slots": 0,
+                "adr_pct": 50.0,
                 "error": str(e),
             }
