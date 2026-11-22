@@ -426,10 +426,10 @@ def run_preflight_checks(env_override: Optional[str] = None, skip_ws: bool = Fal
 
     cs_data = mkt_res.get("condition_search", {})
     if cs_data.get("status") == "PASS":
-        checklist.append(("HTS 조건검색 API (모닝_돌파주)", "PASS", f"{cs_data.get('latency_ms')}ms ({cs_data.get('count')}개 종목 수신)"))
-        console.print(f"  [green]✓[/green] HTS 조건검색 API (seq='0') 수신 성공 ({cs_data.get('latency_ms')}ms, {cs_data.get('count')}개)")
+        checklist.append(("HTS 조건검색 API (모닝_돌파주도주)", "PASS", f"{cs_data.get('latency_ms')}ms ({cs_data.get('count')}개 종목 수신)"))
+        console.print(f"  [green]✓[/green] HTS 조건검색 API (seq='0', 모닝_돌파주도주) 수신 성공 ({cs_data.get('latency_ms')}ms, {cs_data.get('count')}개)")
     else:
-        checklist.append(("HTS 조건검색 API (모닝_돌파주)", "FAIL", cs_data.get("error", "오류")))
+        checklist.append(("HTS 조건검색 API (모닝_돌파주도주)", "FAIL", cs_data.get("error", "오류")))
         console.print(f"  [red]✗[/red] HTS 조건검색 API 실패: {cs_data.get('error')}")
     console.print()
 

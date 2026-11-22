@@ -8,22 +8,28 @@ from typing import Dict, Type, Any, Optional
 from strategy.base import IScanner, IEntryRule, IExitPolicy
 from strategy.composite import CompositeStrategy
 from strategy.scanners.morning_leader_scanner import MorningLeaderScanner
+from strategy.scanners.open_window_scanner import OpenWindowScanner
 from strategy.entries.morning_breakout_entry import MorningBreakoutEntry
+from strategy.entries.open_window_entry import OpenWindowEntry
 from strategy.exits.morning_leader_exit import MorningLeaderExit
 from strategy.exits.dynamic_leader_exit import DynamicLeaderExit
+from strategy.exits.trailing_lock_exit import TrailingLockExit
 
 
 SCANNERS: Dict[str, Type[IScanner]] = {
     "morning_leader": MorningLeaderScanner,
+    "open_window": OpenWindowScanner,
 }
 
 ENTRIES: Dict[str, Type[IEntryRule]] = {
     "morning_breakout": MorningBreakoutEntry,
+    "open_window": OpenWindowEntry,
 }
 
 EXITS: Dict[str, Type[IExitPolicy]] = {
     "morning_leader": MorningLeaderExit,
     "dynamic_leader": DynamicLeaderExit,
+    "trailing_lock": TrailingLockExit,
 }
 
 

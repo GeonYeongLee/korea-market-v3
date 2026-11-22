@@ -68,6 +68,7 @@ class CompositeStrategy(BaseStrategy):
 
         self.current_slot_notional: float = (total_capital / max(1, max_daily_positions)) if max_daily_positions > 0 else 0.0
         self._active_candidates: Set[str] = set()
+        self._active_positions: Set[str] = set()
         self._daily_trade_count: int = 0
         self._pending_ref_bars: Dict[str, Dict[str, Any]] = {}
 
@@ -86,10 +87,7 @@ class CompositeStrategy(BaseStrategy):
         return time(latest.hour + m // 60, m % 60)
 
     def on_start(self, context: Any) -> None:
-        logger.info(
-            f"🚀 [{self.name} Started] Scanner: {self.scanner.name} | "
-            f"Entry: {self.entry.name} | Exit: {self.exit_policy.name}"
-        )
+        logger.info(f"🚀 [{self.name} Started] Scanner: {self.scanner.name} | Entry: {self.entry.name} | Exit: {self.exit_policy.name}")
 
     def on_stop(self, context: Any) -> None:
         logger.info(f"🛑 [{self.name} Stopped]")
@@ -103,20 +101,14 @@ class CompositeStrategy(BaseStrategy):
 
     def sync_capital_with_balance(self, available_cash: float) -> None:
         """Dynamically caps trading capital to actual available cash (buffer 0.5%) if under total_capital."""
-        if available_cash > 0:
-            if available_cash < self.total_capital:
-                self.effective_capital = available_cash * 0.995
-            else:
-                self.effective_capital = self.total_capital
-
-            if self.max_daily_positions > 0:
-                self.current_slot_notional = self.effective_capital / self.max_daily_positions
-                if hasattr(self.entry, "target_notional"):
-                    self.entry.target_notional = self.current_slot_notional
-                logger.info(
-                    f"💰 [{self.name}] Capital Synchronized: Available {available_cash:,.0f} KRW "
-                    f"-> Effective {self.effective_capital:,.0f} KRW ({self.current_slot_notional:,.0f} KRW/slot, {self.max_daily_positions} slots)"
-                )
+        if available_cash <= 0:
+            return
+        self.effective_capital = available_cash * 0.995 if available_cash < self.total_capital else self.total_capital
+        if self.max_daily_positions > 0:
+            self.current_slot_notional = self.effective_capital / self.max_daily_positions
+            if hasattr(self.entry, "target_notional"):
+                self.entry.target_notional = self.current_slot_notional
+            logger.info(f"💰 [{self.name}] Capital Synced: Cash {available_cash:,.0f} -> Effective {self.effective_capital:,.0f} ({self.current_slot_notional:,.0f} KRW/slot)")
 
     def _configure_regime(self, current_date: date) -> None:
         provider = self.regime_provider or get_default_market_regime_provider()
@@ -167,6 +159,7 @@ class CompositeStrategy(BaseStrategy):
 
     def on_day_open(self, context: Any, current_date: date) -> None:
         self._active_candidates.clear()
+        self._active_positions.clear()
         self._daily_trade_count = 0
         self._pending_ref_bars.clear()
 
@@ -189,7 +182,17 @@ class CompositeStrategy(BaseStrategy):
         self.exit_policy.on_day_open(current_date)
 
     def on_day_close(self, context: Any, current_date: date) -> None:
-        pass
+        # EOD Hard Failsafe: force close any remaining positions to guarantee 0% overnight risk
+        active = set(self._active_positions)
+        if hasattr(context, "get_positions"):
+            active.update(s for s, p in context.get_positions().items() if p and p.quantity > 0)
+        for sym in active:
+            pos = context.get_position(sym)
+            if pos and pos.quantity > 0:
+                logger.warning(f"🚨 [EOD FAILSAFE] Liquidating unclosed {sym} at day close {current_date}")
+                context.liquidate(sym, price=pos.current_price, tag="EOD_FAILSAFE_LIQUIDATION")
+        self._active_positions.clear()
+        self._active_candidates.clear()
 
     def on_bar(self, context: Any, bar: MinuteBar) -> None:
         # Step 1: Manage Active Positions via Exit Policy
@@ -206,6 +209,7 @@ class CompositeStrategy(BaseStrategy):
                     f"Target: {tgt_str} KRW | Exec: {exec_price:,.0f} KRW"
                 )
                 context.liquidate(position.symbol, price=exec_price, tag=exit_signal.reason)
+                self._active_positions.discard(position.symbol)
             return
 
         # Step 2: Check Daily Limit
@@ -227,10 +231,12 @@ class CompositeStrategy(BaseStrategy):
             ctx_state = {"day_open": day_open} if day_open else None
             entry_signal = self.entry.evaluate_entry(bar.symbol, bar, context_state=ctx_state)
             if entry_signal and self.current_slot_notional > 0 and entry_signal.collar_cap_price > 0:
-                target_qty = int(self.current_slot_notional // entry_signal.collar_cap_price)
+                # Include slippage and commission buffer (0.5%) to guarantee execution without cash breach
+                est_exec_price = entry_signal.collar_cap_price * 1.002
+                target_qty = int(self.current_slot_notional // est_exec_price)
                 bal = context.get_balance() if hasattr(context, "get_balance") else None
                 if bal and bal.cash > 0:
-                    max_affordable_qty = int(bal.cash // entry_signal.collar_cap_price)
+                    max_affordable_qty = int((bal.cash * 0.995) // entry_signal.collar_cap_price)
                     qty = min(target_qty, max_affordable_qty)
                 else:
                     qty = target_qty
@@ -251,6 +257,7 @@ class CompositeStrategy(BaseStrategy):
                     )
                     if order_id is not None:
                         self._daily_trade_count += 1
+                        self._active_positions.add(bar.symbol)
                         self._active_candidates.discard(bar.symbol)
                         pos = context.get_position(bar.symbol)
                         if pos:
@@ -266,16 +273,19 @@ class CompositeStrategy(BaseStrategy):
             exit_signal = self.exit_policy.evaluate_exit(position, None, tick=tick)
             if exit_signal:
                 context.liquidate(tick.symbol, price=tick.price, tag=exit_signal.reason)
+                self._active_positions.discard(tick.symbol)
 
     def on_order_event(self, context: Any, event: OrderEvent) -> None:
         if event.side == OrderSide.BUY:
             if event.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
                 if event.filled_quantity == 0:
                     self._daily_trade_count = max(0, self._daily_trade_count - 1)
+                    self._active_positions.discard(event.symbol)
                     if hasattr(self.entry, "rollback_entered_symbol"):
                         self.entry.rollback_entered_symbol(event.symbol)
                 self._pending_ref_bars.pop(event.symbol, None)
             elif event.status == OrderStatus.FILLED:
+                self._active_positions.add(event.symbol)
                 position = context.get_position(event.symbol)
                 if position:
                     ref_bar = self._pending_ref_bars.pop(event.symbol, None)
@@ -284,3 +294,5 @@ class CompositeStrategy(BaseStrategy):
                         if ref_bar.get("prior_atr20_pct") is not None:
                             position.metadata.setdefault("prior_atr20_pct", ref_bar["prior_atr20_pct"])
                     self.exit_policy.on_position_opened(position)
+        elif event.side == OrderSide.SELL and event.status == OrderStatus.FILLED:
+            self._active_positions.discard(event.symbol)
