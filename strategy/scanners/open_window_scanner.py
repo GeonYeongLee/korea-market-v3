@@ -122,6 +122,12 @@ class OpenWindowScanner(IScanner):
                 pass
         self._prev_data_loaded = True
 
+    def feed_condition_search_symbol(self, symbol: str) -> None:
+        """External hook for KIS HTS Condition Search real-time alerts."""
+        if getattr(self, "_condition_symbols", None) is None:
+            self._condition_symbols = set()
+        self._condition_symbols.add(symbol)
+
     def is_disqualified(self, symbol: str) -> bool:
         """Returns True if the symbol has been permanently disqualified today."""
         return symbol in self._disqualified_symbols

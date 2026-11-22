@@ -238,7 +238,7 @@ class CompositeStrategy(BaseStrategy):
                     order_id = context.buy(
                         symbol=bar.symbol, quantity=qty, price=entry_signal.collar_cap_price, tag=entry_signal.reason
                     )
-                    if order_id is not None:
+                    if order_id:
                         self._daily_trade_count += 1
                         self._active_positions.add(bar.symbol)
                         self._active_candidates.discard(bar.symbol)

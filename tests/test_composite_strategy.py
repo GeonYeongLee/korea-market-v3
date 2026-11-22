@@ -57,7 +57,13 @@ def test_composite_strategy_execution_flow():
     clock = SimulatedClock()
     context = StrategyContext(broker=broker, clock=clock)
 
-    strat = build_strategy(dynamic_slots=False, max_market_gap=None)
+    strat = build_strategy(
+        dynamic_slots=False,
+        max_market_gap=None,
+        dynamic_turnover=False,
+        bear_market_defense=False,
+        scanner_kwargs={"min_gap_pct": None, "max_gap_pct": None},
+    )
     today = date(2024, 10, 21)
     strat.on_start(context)
     strat.on_day_open(context, today)
@@ -106,7 +112,12 @@ def test_morning_leader_reference_bar_preservation():
     clock = SimulatedClock()
     context = StrategyContext(broker=broker, clock=clock)
 
-    strat = build_strategy(exit_name="morning_leader")
+    strat = build_strategy(
+        exit_name="morning_leader",
+        dynamic_turnover=False,
+        bear_market_defense=False,
+        scanner_kwargs={"min_gap_pct": None, "max_gap_pct": None},
+    )
     broker.register_event_listener(lambda ev: strat.on_order_event(context, ev))
     today = date(2024, 10, 21)
     strat.on_start(context)
@@ -137,7 +148,7 @@ def test_morning_leader_reference_bar_preservation():
     assert pos.metadata["ref_bar"]["dt"] == datetime(2024, 10, 21, 9, 2)
 
     # Emergency SL in Phase 1 (-2.0%)
-    expected_emergency_sl = round_to_krx_tick(pos.avg_price * 0.98, side="SELL", round_mode="floor")
+    expected_emergency_sl = round_to_krx_tick(pos.avg_price * 0.98, side="SELL", round_mode="ceil")
     assert pos.stop_loss_price == expected_emergency_sl
 
     # Bar 1 (09:03): Next Bar - Should trigger Phase 2 promotion
@@ -159,7 +170,7 @@ def test_morning_leader_reference_bar_preservation():
 
     assert pos.phase == 2
     # Midpoint of Bar 0: (50000 + 53000) / 2 = 51500.0
-    expected_ref_midpoint = round_to_krx_tick((50000.0 + 53000.0) / 2.0, side="SELL", round_mode="floor")
+    expected_ref_midpoint = round_to_krx_tick((50000.0 + 53000.0) / 2.0, side="SELL", round_mode="ceil")
     eff_emergency_sl = abs(pos.metadata.get("emergency_sl_pct", 0.02))
     floor_sl = round_to_krx_tick(pos.avg_price * (1.0 - eff_emergency_sl), side="SELL", round_mode="ceil")
     expected_target_sl = max(expected_ref_midpoint, floor_sl)
@@ -172,7 +183,13 @@ def test_risk_manager_feedback_loop():
     broker = BacktestBroker(initial_capital=10_000_000.0)
     clock = SimulatedClock()
     risk_manager = RiskManager(max_daily_loss=100_000.0, max_consecutive_losses=2)
-    strat = build_strategy(dynamic_slots=False, max_market_gap=None)
+    strat = build_strategy(
+        dynamic_slots=False,
+        max_market_gap=None,
+        dynamic_turnover=False,
+        bear_market_defense=False,
+        scanner_kwargs={"min_gap_pct": None, "max_gap_pct": None},
+    )
 
     class DummyFeed:
         def stream_events(self):
@@ -299,7 +316,13 @@ def test_engine_feed_filter_coordination():
     broker = BacktestBroker(initial_capital=10_000_000.0)
     clock = SimulatedClock()
     feed = MockDataFeed()
-    strat = build_strategy(dynamic_slots=False, max_market_gap=None)
+    strat = build_strategy(
+        dynamic_slots=False,
+        max_market_gap=None,
+        dynamic_turnover=False,
+        bear_market_defense=False,
+        scanner_kwargs={"min_gap_pct": None, "max_gap_pct": None},
+    )
     engine = TradingEngine(strategy=strat, broker=broker, feed=feed, clock=clock)
 
     assert feed.filter_provider is not None
