@@ -44,10 +44,6 @@ class TokenManager:
     def _token_cache_file(self) -> Path:
         return self.cache_dir / f"token_{self.cfg.env}_{self._get_key_hash()}.json"
 
-    @property
-    def _approval_cache_file(self) -> Path:
-        return self.cache_dir / f"approval_{self.cfg.env}_{self._get_key_hash()}.json"
-
     def _atomic_write_json(self, file_path: Path, data: Dict[str, Any]) -> None:
         """Atomically writes JSON payload using temporary file replacement."""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -168,30 +164,19 @@ class TokenManager:
     def get_approval_key(self, force_refresh: bool = False) -> str:
         """
         Retrieves WebSocket connection approval key (/oauth2/Approval).
+        Strictly session-scoped and held in-memory (never written to disk)
+        to prevent stale/revoked key reuse across processes or runs.
         """
         with self._lock:
             if not force_refresh and self._cached_approval_key:
                 return self._cached_approval_key
-
-            approval_file = self._approval_cache_file
-            if not force_refresh and approval_file.exists():
-                try:
-                    with open(approval_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    saved_at = datetime.fromisoformat(data.get("saved_at", ""))
-                    # Approval key is valid for 24h; reuse within 20h
-                    if datetime.now() - saved_at < timedelta(hours=20):
-                        self._cached_approval_key = data.get("approval_key")
-                        return self._cached_approval_key
-                except Exception:
-                    pass
 
             if not self.cfg.app_key or not self.cfg.app_secret:
                 raise ValueError(
                     f"[{self.cfg.env.upper()}] KIS AppKey or AppSecret is missing for WebSocket Approval."
                 )
 
-            logger.info(f"[{self.cfg.env.upper()}] Requesting WebSocket approval key...")
+            logger.info(f"[{self.cfg.env.upper()}] Requesting fresh in-memory WebSocket approval key...")
             url = f"{self.cfg.endpoints.rest_url}/oauth2/Approval"
             headers = {"content-type": "application/json"}
             payload = {
@@ -221,9 +206,11 @@ class TokenManager:
                 raise RuntimeError(f"WebSocket Approval response did not contain approval_key: {data}")
 
             self._cached_approval_key = approval_key
-            self._atomic_write_json(approval_file, {
-                "approval_key": approval_key,
-                "saved_at": datetime.now().isoformat(),
-            })
-
+            logger.info(f"[{self.cfg.env.upper()}] In-memory WebSocket approval key acquired successfully.")
             return approval_key
+
+    def invalidate_approval_key(self) -> None:
+        """Invalidates in-memory WebSocket approval key so the next connection attempt fetches a fresh key."""
+        with self._lock:
+            self._cached_approval_key = None
+            logger.info(f"[{self.cfg.env.upper()}] In-memory WebSocket approval key invalidated.")

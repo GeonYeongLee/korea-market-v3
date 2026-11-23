@@ -58,6 +58,9 @@ class KISWebSocketClient:
         self._reconnect_delay = 3.0
         self._aes_key: Optional[str] = None
         self._aes_iv: Optional[str] = None
+        self.connection_state: str = "DISCONNECTED"
+        self.last_msg_time: float = 0.0
+        self.total_messages_received: int = 0
 
     @property
     def ws_url(self) -> str:
@@ -68,11 +71,34 @@ class KISWebSocketClient:
         """Register async callback function for incoming market ticks and executions."""
         self._callbacks.append(cb)
 
+    @property
+    def is_healthy(self) -> bool:
+        """Checks whether WebSocket connection is healthy and active."""
+        return self.connection_state == "CONNECTED" and self.is_connected
+
+    async def hard_reconnect(self) -> None:
+        """Forces WebSocket reconnect with newly acquired credentials."""
+        logger.info("Initiating hard WebSocket reconnect...")
+        self.token_mgr.invalidate_approval_key()
+        self.connection_state = "DISCONNECTED"
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
     async def connect(self) -> None:
         """Establishes WebSocket connection and starts listener loop."""
         self._running = True
 
         while self._running:
+            if self.connection_state == "AUTH_FAILED":
+                # Do not blindly loop when auth has failed; wait for watchdog/reboot
+                await asyncio.sleep(self._reconnect_delay)
+                continue
+
+            self.connection_state = "CONNECTING"
             try:
                 approval_key = self.token_mgr.get_approval_key()
                 logger.info(f"Connecting to KIS WebSocket: {self.ws_url}")
@@ -82,6 +108,7 @@ class KISWebSocketClient:
                     ping_timeout=10,
                 ) as ws:
                     self._ws = ws
+                    self.connection_state = "CONNECTED"
                     logger.info("WebSocket connected successfully.")
 
                     # Resubscribe to previous symbols if reconnecting
@@ -96,13 +123,27 @@ class KISWebSocketClient:
                     async for message in ws:
                         if not self._running:
                             break
+                        self.last_msg_time = asyncio.get_event_loop().time()
+                        self.total_messages_received += 1
                         await self._handle_message(message)
+                        if self.connection_state == "AUTH_FAILED":
+                            break
 
             except (websockets.ConnectionClosed, OSError) as e:
-                logger.warning(f"WebSocket connection lost: {e}. Reconnecting in {self._reconnect_delay}s...")
+                if self.connection_state != "AUTH_FAILED":
+                    self.connection_state = "DISCONNECTED"
+                    logger.warning(f"WebSocket connection lost: {e}. Reconnecting in {self._reconnect_delay}s...")
                 await asyncio.sleep(self._reconnect_delay)
             except Exception as e:
-                logger.error(f"Unexpected WebSocket error: {e}", exc_info=True)
+                err_str = str(e).lower()
+                if "401" in err_str or "403" in err_str or "approval" in err_str or "auth" in err_str:
+                    logger.error(f"🚨 [WS Auth Failed] WebSocket connection failed with authentication error: {e}")
+                    self.connection_state = "AUTH_FAILED"
+                    self.token_mgr.invalidate_approval_key()
+                else:
+                    if self.connection_state != "AUTH_FAILED":
+                        self.connection_state = "DISCONNECTED"
+                    logger.error(f"Unexpected WebSocket error: {e}", exc_info=True)
                 await asyncio.sleep(self._reconnect_delay)
 
     @property
@@ -122,6 +163,7 @@ class KISWebSocketClient:
     async def disconnect(self) -> None:
         """Gracefully disconnect WebSocket."""
         self._running = False
+        self.connection_state = "DISCONNECTED"
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -198,20 +240,38 @@ class KISWebSocketClient:
                     if self._ws:
                         await self._ws.send(raw)
                     return
-                msg_cd = data.get("body", {}).get("msg_cd")
-                if msg_cd == "OPSP0011":
-                    logger.error("🚨 [WS Approval Key Invalid/Expired] KIS returned OPSP0011. Force refreshing approval key...")
-                    self.token_mgr.get_approval_key(force_refresh=True)
+                body = data.get("body", {})
+                msg_cd = body.get("msg_cd")
+                msg1 = body.get("msg1", "")
+
+                # Detect authentication failure codes (e.g. OPSP0011, OPSP0012, or invalid approval message)
+                if (
+                    msg_cd in ("OPSP0011", "OPSP0012", "OPSP0013")
+                    or "invalid approval" in msg1.lower()
+                    or "not found" in msg1.lower()
+                ):
+                    logger.error(
+                        f"🚨 [WS Auth Failed] KIS auth failure frame received: msg_cd={msg_cd}, msg1={msg1}. "
+                        "Marking connection_state='AUTH_FAILED' and invalidating approval key."
+                    )
+                    self.connection_state = "AUTH_FAILED"
+                    self.token_mgr.invalidate_approval_key()
+                    telemetry.record_ws_frame(
+                        frame_type="CONTROL",
+                        tr_id=tr_id or "AUTH_FAILED",
+                        data={"msg_cd": msg_cd, "msg1": msg1, "error": "AUTH_FAILED"},
+                    )
                     if self._ws:
                         await self._ws.close()
                     return
-                output = data.get("body", {}).get("output", {})
+
+                output = body.get("output", {})
                 if tr_id in ("H0STCNI0", "H0STCNI9") and output:
                     self._aes_iv = output.get("iv")
                     self._aes_key = output.get("key")
                     logger.info(f"Execution notice AES encryption key acquired for {tr_id}")
                 logger.debug(f"WS Control: tr_id={tr_id}, msg={msg_cd}")
-                telemetry.record_ws_frame(frame_type="CONTROL", tr_id=tr_id or "UNKNOWN", data={"msg_cd": msg_cd})
+                telemetry.record_ws_frame(frame_type="CONTROL", tr_id=tr_id or "UNKNOWN", data={"msg_cd": msg_cd, "msg1": msg1})
             except Exception:
                 pass
             return

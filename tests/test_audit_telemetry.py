@@ -310,3 +310,39 @@ def test_rest_client_telemetry_recording(tmp_path):
     assert api_rec["rt_cd"] == "0"
     assert api_rec["latency_ms"] >= 0.0
 
+
+def test_reconciliation_stage0_feed_outage_gate(tmp_path):
+    """
+    Verifies Stage 0 Data Integrity Gate in reconciliation:
+    0 live trades due to feed outage/blackout MUST trigger CRITICAL_SYSTEM_OUTAGE,
+    while 0 live trades with healthy ticks produces NO_TRADE_MATCH.
+    """
+    from engine.reconciliation import reconcile_daily_trading
+    target_date = "20261120"
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("engine.reconciliation.settings.logs_dir", logs_dir), \
+         patch("engine.reconciliation.run_reconciliation_backtest", return_value=(None, [])):
+
+        # Case A: Live feed blackout (0 ticks, live_feed_healthy=False)
+        res_outage = reconcile_daily_trading(
+            target_date=target_date,
+            total_ticks=0,
+            live_feed_healthy=False,
+        )
+        assert res_outage.status == "CRITICAL_SYSTEM_OUTAGE"
+        assert any("CRITICAL_SYSTEM_OUTAGE" in c for c in res_outage.root_causes)
+        assert res_outage.items[0].metric == "데이터 피드 무결성 (Stage 0)"
+        assert res_outage.items[0].status == "DIFF"
+
+        # Case B: Normal observation (150 ticks received, no trades met conditions)
+        res_normal = reconcile_daily_trading(
+            target_date=target_date,
+            total_ticks=150,
+            live_feed_healthy=True,
+        )
+        assert res_normal.status == "NO_TRADE_MATCH"
+        assert res_normal.items[0].metric == "데이터 피드 무결성 (Stage 0)"
+        assert res_normal.items[0].status == "MATCH"
+

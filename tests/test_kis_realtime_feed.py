@@ -106,3 +106,31 @@ def test_feed_execution_notice_routing(mock_ws_client):
     # Run the async ws message handler
     asyncio.run(feed._on_ws_message("EXECUTION", notice))
     mock_broker.handle_execution_notice.assert_called_once_with(notice)
+
+
+def test_feed_tick_tracking_and_metrics(mock_ws_client):
+    """Verifies that KisRealtimeFeed actively tracks total_ticks_received and last_tick_time."""
+    feed = KisRealtimeFeed(ws_client=mock_ws_client)
+    assert feed.total_ticks_received == 0
+    assert feed.last_tick_time == 0.0
+
+    tick_data = {
+        "symbol": "005930",
+        "price": 75000.0,
+        "volume": 100,
+        "cum_turnover": 7500000.0,
+    }
+
+    asyncio.run(feed._on_ws_message("TICK", tick_data))
+    assert feed.total_ticks_received == 1
+    assert feed.last_tick_time > 0.0
+
+
+def test_feed_reboot_and_hard_reconnect(mock_ws_client):
+    """Verifies feed.reboot() invokes client hard reconnect and invalidates approval key."""
+    mock_token_mgr = MagicMock()
+    mock_ws_client.token_mgr = mock_token_mgr
+    feed = KisRealtimeFeed(ws_client=mock_ws_client)
+
+    feed.reboot()
+    mock_token_mgr.invalidate_approval_key.assert_called_once()

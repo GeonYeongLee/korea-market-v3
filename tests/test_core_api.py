@@ -229,3 +229,82 @@ def test_krx_symbols():
 
     assert get_name_by_symbol("005930") == "삼성전자"
     assert get_symbol_by_name("삼성전자") == "005930"
+
+
+def test_approval_key_in_memory_lifecycle(tmp_path):
+    """
+    Verifies WebSocket approval key is strictly held in memory and never written to disk,
+    and invalidate_approval_key() properly forces re-acquisition.
+    """
+    cfg = Settings()
+    cfg.token_cache_dir = tmp_path / ".tokens"
+    tm = TokenManager(cfg)
+
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"approval_key": "app_key_111"}
+        mock_post.return_value = mock_resp
+
+        # First request
+        key1 = tm.get_approval_key()
+        assert key1 == "app_key_111"
+        assert mock_post.call_count == 1
+
+        # Confirm NO approval file is written to disk
+        approval_files = list(cfg.token_cache_dir.glob("approval_*.json"))
+        assert len(approval_files) == 0
+
+        # Second request: served from in-memory cache
+        mock_resp.json.return_value = {"approval_key": "app_key_222"}
+        key2 = tm.get_approval_key()
+        assert key2 == "app_key_111"
+        assert mock_post.call_count == 1
+
+        # Invalidate approval key
+        tm.invalidate_approval_key()
+        assert tm._cached_approval_key is None
+
+        # Third request: acquires new approval key
+        key3 = tm.get_approval_key()
+        assert key3 == "app_key_222"
+        assert mock_post.call_count == 2
+        assert len(list(cfg.token_cache_dir.glob("approval_*.json"))) == 0
+
+
+def test_ws_client_connection_state_and_auth_failure():
+    """
+    Verifies WebSocket client connection_state tracking, health check,
+    and transition to AUTH_FAILED on OPSP0011 frame.
+    """
+    cfg = Settings()
+    mock_token_mgr = MagicMock()
+    mock_token_mgr.get_approval_key.return_value = "dummy_app_key"
+
+    client = KISWebSocketClient(cfg=cfg, token_mgr=mock_token_mgr)
+    assert client.connection_state == "DISCONNECTED"
+    assert client.is_healthy is False
+    assert client.total_messages_received == 0
+    assert client.last_msg_time == 0.0
+
+    # Simulate arrival of an auth failure frame (OPSP0011)
+    auth_fail_raw = json.dumps({
+        "header": {"tr_id": "H0UNCNT0"},
+        "body": {"msg_cd": "OPSP0011", "msg1": "Invalid approval key: NOT FOUND"}
+    })
+
+    async def _test_msg():
+        await client._handle_message(auth_fail_raw)
+
+    asyncio.run(_test_msg())
+
+    assert client.connection_state == "AUTH_FAILED"
+    assert client.is_healthy is False
+    mock_token_mgr.invalidate_approval_key.assert_called_once()
+
+    # Test hard_reconnect resets state
+    async def _test_reconnect():
+        await client.hard_reconnect()
+
+    asyncio.run(_test_reconnect())
+    assert client.connection_state == "DISCONNECTED"

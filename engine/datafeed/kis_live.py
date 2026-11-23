@@ -9,6 +9,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 from datetime import datetime
 from typing import List, Optional, Iterator, Union, Any, Dict, Callable
 
@@ -43,6 +44,8 @@ class KisRealtimeFeed(IDataFeed):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws_thread: Optional[threading.Thread] = None
         self.execution_callback: Optional[Callable[[Dict[str, Any]], Any]] = None
+        self.total_ticks_received: int = 0
+        self.last_tick_time: float = 0.0
 
         # Wire aggregator callbacks
         self.aggregator.register_bar_callback(self._on_aggregator_bar)
@@ -75,6 +78,7 @@ class KisRealtimeFeed(IDataFeed):
 
     def start(self) -> None:
         """Starts background thread running asyncio loop for WebSocket connection."""
+        self._stop_event.clear()
         if self._ws_thread is not None and self._ws_thread.is_alive():
             return
 
@@ -199,6 +203,8 @@ class KisRealtimeFeed(IDataFeed):
 
     async def _on_aggregator_tick(self, symbol: str, price_data: Any, dt: datetime) -> None:
         """Handles real-time tick events from aggregator."""
+        self.total_ticks_received += 1
+        self.last_tick_time = time.time()
         if isinstance(price_data, dict):
             px = float(price_data.get("price", 0.0))
             vol = int(price_data.get("volume", 1))
@@ -273,3 +279,27 @@ class KisRealtimeFeed(IDataFeed):
                 pass
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
+
+    def hard_reconnect(self) -> None:
+        """Triggers an immediate hard reconnect on the underlying WebSocket client."""
+        self.reboot()
+
+    def reboot(self) -> None:
+        """
+        Hard re-initialization of WebSocket feed.
+        Invalidates approval key, triggers fresh connection with newly acquired approval key,
+        and resubscribes all active symbols.
+        """
+        logger.warning("🚨 [KisRealtimeFeed] Hard reboot triggered! Re-initializing WebSocket feed...")
+        self._stop_event.clear()
+        if self.ws_client:
+            if hasattr(self.ws_client, "token_mgr") and self.ws_client.token_mgr:
+                self.ws_client.token_mgr.invalidate_approval_key()
+            if hasattr(self.ws_client, "hard_reconnect") and self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(self.ws_client.hard_reconnect(), self._loop)
+            elif hasattr(self.ws_client, "connection_state"):
+                self.ws_client.connection_state = "DISCONNECTED"
+
+        if self._ws_thread is None or not self._ws_thread.is_alive():
+            logger.info("[KisRealtimeFeed] WS thread dead during reboot; restarting thread...")
+            self.start()

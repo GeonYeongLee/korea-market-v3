@@ -265,9 +265,44 @@ class DailyRoutineOrchestrator:
                 console.print("[green]✓ 실시간 스캐너 및 웹소켓 호가 엔진이 가동되었습니다. 매매 완료를 실시간 감시합니다...[/green]")
 
                 last_eod_attempt: Dict[str, float] = {}
+                loop_start_ts: float = time.time()
+                last_watchdog_reboot: float = 0.0
+
                 while True:
                     time.sleep(1.0)
                     curr_t = datetime.now().time()
+                    now_ts = time.time()
+
+                    # Feed Watchdog (09:00:15 ~ 15:20)
+                    if curr_t >= dtime(9, 0, 15) and curr_t < dtime(15, 20, 0):
+                        ws_c = getattr(datafeed, "ws_client", None)
+                        ws_state = getattr(ws_c, "connection_state", "CONNECTED") if ws_c else "CONNECTED"
+                        active_syms = getattr(datafeed, "active_symbols", [])
+                        last_tick = getattr(datafeed, "last_tick_time", 0.0)
+
+                        silence_sec = (now_ts - last_tick) if last_tick > 0 else (now_ts - loop_start_ts)
+                        is_stalled = len(active_syms) > 0 and silence_sec > 30.0
+                        is_auth_failed = ws_state == "AUTH_FAILED"
+
+                        if (is_stalled or is_auth_failed) and (now_ts - last_watchdog_reboot >= 30.0):
+                            last_watchdog_reboot = now_ts
+                            diag_reason = (
+                                "AUTH_FAILED (인증 실패/approval_key 만료)"
+                                if is_auth_failed
+                                else f"시세 틱 수신 중단 ({silence_sec:.1f}초 침묵, 구독종목 {len(active_syms)}개)"
+                            )
+                            console.print(Panel.fit(
+                                f"[bold red]🚨 [FEED WATCHDOG] 실시간 시세 피드 장애 감지![/bold red]\n"
+                                f"• [yellow]원인[/yellow]: {diag_reason}\n"
+                                f"• [cyan]조치[/cyan]: approval_key 무효화 및 WebSocket 하드 재기동(Reboot) 수행\n"
+                                f"• [white]구독 종목 복구[/white]: {', '.join(active_syms) if active_syms else '없음'}",
+                                border_style="red"
+                            ))
+                            logger.error(f"[FeedWatchdog] Triggering feed reboot: {diag_reason}")
+                            if hasattr(datafeed, "reboot"):
+                                datafeed.reboot()
+                            elif hasattr(datafeed, "hard_reconnect"):
+                                datafeed.hard_reconnect()
 
                     # 15:20 KRX 장마감 동시호가 전량 청산 (오버나잇 0% 불변량, 15:28:00까지 지속 재시도)
                     if curr_t >= dtime(15, 20, 0) and curr_t <= dtime(15, 28, 0):
@@ -342,6 +377,8 @@ class DailyRoutineOrchestrator:
                 scanner_name=self.scanner_name,
                 entry_name=self.entry_name,
                 exit_name=self.exit_name,
+                total_ticks=getattr(datafeed, "total_ticks_received", 0),
+                live_feed_healthy=(getattr(getattr(datafeed, "ws_client", None), "connection_state", "") != "AUTH_FAILED"),
             )
             display_reconciliation_table(rec_res)
         except Exception as re:

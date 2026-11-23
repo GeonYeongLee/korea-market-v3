@@ -120,7 +120,7 @@ class ReconciliationResult:
     reconciled_at: str
     backtest_executed: bool
     live_executed: bool
-    status: str  # "MATCH", "ACCEPTABLE_SLIPPAGE", "DISCREPANCY", "NO_TRADE_MATCH"
+    status: str  # "MATCH", "ACCEPTABLE_SLIPPAGE", "DISCREPANCY", "NO_TRADE_MATCH", "CRITICAL_SYSTEM_OUTAGE", "FEED_OUTAGE_ABORT"
     backtest_symbol: Optional[str] = None
     live_symbol: Optional[str] = None
     symbol_match: bool = False
@@ -290,6 +290,9 @@ def parse_telemetry_logs(date_compact: str) -> Dict[str, Any]:
         "api_avg_latency_ms": 0.0,
         "api_max_latency_ms": 0.0,
         "ws_frames_count": 0,
+        "ws_ticks_count": 0,
+        "feed_outage_detected": False,
+        "feed_auth_failed": False,
         "order_latencies_ms": [],
         "order_slippages_bp": [],
         "avg_execution_latency_ms": 0.0,
@@ -377,8 +380,35 @@ def parse_telemetry_logs(date_compact: str) -> Dict[str, Any]:
                             summary["api_failed_calls"] += 1
                     elif chan == "WS":
                         summary["ws_frames_count"] += 1
+                        ftype = row.get("frame_type", "")
+                        if ftype == "TICK":
+                            summary["ws_ticks_count"] = summary.get("ws_ticks_count", 0) + 1
+                        elif ftype == "CONTROL":
+                            cdata = row.get("data", {})
+                            mcd = str(cdata.get("msg_cd", ""))
+                            m1 = str(cdata.get("msg1", "")).lower()
+                            err = str(cdata.get("error", ""))
+                            if (
+                                mcd in ("OPSP0011", "OPSP0012", "OPSP0013")
+                                or "invalid approval" in m1
+                                or "not found" in m1
+                                or err == "AUTH_FAILED"
+                            ):
+                                summary["feed_auth_failed"] = True
+                                summary["feed_outage_detected"] = True
                 except Exception:
                     pass
+
+    # 4. Check application log for watchdog alerts or auth errors
+    app_log = settings.logs_dir / f"trading_{date_compact}.log"
+    if app_log.exists():
+        try:
+            with open(app_log, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+                if "FEED WATCHDOG" in content or "AUTH_FAILED" in content or "OPSP0011" in content:
+                    summary["feed_outage_detected"] = True
+        except Exception:
+            pass
 
     if summary["api_latencies"]:
         summary["api_avg_latency_ms"] = round(sum(summary["api_latencies"]) / len(summary["api_latencies"]), 2)
@@ -452,10 +482,13 @@ def reconcile_daily_trading(
     entry_name: str = "morning_breakout",
     exit_name: str = "morning_leader",
     strategy_name: Optional[str] = None,
+    live_feed_healthy: Optional[bool] = None,
+    total_ticks: Optional[int] = None,
 ) -> ReconciliationResult:
     """
     Executes comprehensive reconciliation between post-market 1-minute backtest
     and actual live/mock trading execution logs for the given target date.
+    Strictly audits Stage 0 Data Integrity (feed health / zero ticks blackout).
     """
     if target_date is None:
         target_date = datetime.now().strftime("%Y-%m-%d")
@@ -476,9 +509,26 @@ def reconcile_daily_trading(
     bt_by_sym: Dict[str, Any] = {t.symbol: t for t in bt_trades}
     bt_has_trade = len(bt_trades) > 0
 
-    # 2. Live Trading Logs for today
+    # 2. Live Trading Logs and Telemetry for today
     live_events, live_by_sym = parse_live_audit_log(date_compact)
     live_has_trade = len(live_by_sym) > 0
+    telemetry_data = parse_telemetry_logs(date_compact)
+
+    # Stage 0: Data Integrity & Feed Health Audit
+    ws_ticks = total_ticks if total_ticks is not None else telemetry_data.get("ws_ticks_count", 0)
+    ws_frames = telemetry_data.get("ws_frames_count", 0)
+    feed_outage = (live_feed_healthy is False) or telemetry_data.get("feed_outage_detected", False)
+
+    live_session_ran = (
+        total_ticks is not None
+        or ws_frames > 0
+        or ws_ticks > 0
+        or telemetry_data.get("api_total_calls", 0) > 0
+        or len(telemetry_data.get("scanner_evaluated", set())) > 0
+        or feed_outage
+        or len(live_events) > 0
+    )
+    is_feed_blackout = (not live_has_trade) and live_session_ran and (ws_ticks == 0 or feed_outage)
 
     all_symbols = sorted(list(set(bt_by_sym.keys()) | set(live_by_sym.keys())))
     symbol_details: List[SymbolReconciliationDetail] = []
@@ -557,7 +607,15 @@ def reconcile_daily_trading(
             root_causes.append(f"[{sym} {sym_name}] 실전만 체결: {diag}")
 
     # Determine Overall Report Status
-    if not bt_has_trade and not live_has_trade:
+    if is_feed_blackout:
+        final_status = "CRITICAL_SYSTEM_OUTAGE"
+        root_causes.insert(
+            0,
+            f"🚨 [STAGE 0 CRITICAL_SYSTEM_OUTAGE] 실시간 시세 피드 블랙아웃/인증 실패 감지 "
+            f"(수신 틱: {ws_ticks}건, 수신 프레임: {ws_frames}건, 장애 감지: {feed_outage}). "
+            "정상 관망(No Trade)이 아닌 시스템 장애로 인한 미체결로 판정합니다."
+        )
+    elif not bt_has_trade and not live_has_trade:
         final_status = "NO_TRADE_MATCH"
         root_causes.append("양측 모두 진입 조건 미발생 (정상 관망 유지)")
     elif all(d.status in ("MATCH", "ACCEPTABLE_SLIPPAGE") for d in symbol_details) and len(symbol_details) > 0:
@@ -585,7 +643,6 @@ def reconcile_daily_trading(
     live_sym_str = ", ".join(f"{s}({t.name})" for s, t in live_by_sym.items()) if live_by_sym else "-"
 
     # Telemetry and Execution Diagnostics
-    telemetry_data = parse_telemetry_logs(date_compact)
     bt_symbols = set(bt_by_sym.keys())
     live_scanned = telemetry_data["scanner_passed"]
     if bt_symbols and live_scanned:
@@ -601,7 +658,20 @@ def reconcile_daily_trading(
 
     avg_exec_lat = telemetry_data["avg_execution_latency_ms"]
 
+    stage0_status = "DIFF" if is_feed_blackout else "MATCH"
+    stage0_live_str = (
+        f"WS 틱 {ws_ticks}건 / 프레임 {ws_frames}건"
+        + (" 🚨[피드 장애/블랙아웃]" if is_feed_blackout else " [정상]")
+    )
+
     items: List[TradeComparisonItem] = [
+        TradeComparisonItem(
+            metric="데이터 피드 무결성 (Stage 0)",
+            backtest_value="1분봉 데이터셋 정상 (100%)",
+            live_value=stage0_live_str,
+            difference="피드 장애/블랙아웃 (0 Ticks)" if is_feed_blackout else "정상",
+            status=stage0_status,
+        ),
         TradeComparisonItem(
             metric="진입 여부 (Trade Executed)",
             backtest_value=f"{len(bt_trades)}건 체결" if bt_has_trade else "미체결 (No Trade)",
@@ -702,7 +772,12 @@ def save_reconciliation_reports(res: ReconciliationResult, date_compact: str) ->
         json.dump(asdict(res), f, ensure_ascii=False, indent=2, default=str)
 
     # 2. Markdown Report
-    status_icon = "✅" if res.status in ("MATCH", "NO_TRADE_MATCH") else ("⚠️" if res.status == "ACCEPTABLE_SLIPPAGE" else "❌")
+    status_icon = (
+        "✅" if res.status in ("MATCH", "NO_TRADE_MATCH")
+        else ("⚠️" if res.status == "ACCEPTABLE_SLIPPAGE"
+        else ("🚨" if res.status in ("CRITICAL_SYSTEM_OUTAGE", "FEED_OUTAGE_ABORT")
+        else "❌"))
+    )
     md_lines = [
         f"# 📊 [{res.target_date}] 백테스트 vs 실전매매 정밀 대사 리포트",
         f"- **대사 시각**: {res.reconciled_at}",
@@ -756,7 +831,12 @@ def save_reconciliation_reports(res: ReconciliationResult, date_compact: str) ->
 
 def display_reconciliation_table(res: ReconciliationResult) -> None:
     """Prints a styled Rich terminal dashboard of the reconciliation audit."""
-    status_color = "green" if res.status in ("MATCH", "NO_TRADE_MATCH") else ("yellow" if res.status == "ACCEPTABLE_SLIPPAGE" else "red")
+    status_color = (
+        "green" if res.status in ("MATCH", "NO_TRADE_MATCH")
+        else ("yellow" if res.status == "ACCEPTABLE_SLIPPAGE"
+        else ("bold red" if res.status in ("CRITICAL_SYSTEM_OUTAGE", "FEED_OUTAGE_ABORT")
+        else "red"))
+    )
     console.print(Panel.fit(
         f"[bold {status_color}]⚖️ [RECONCILIATION] {res.target_date} 백테스트 vs 실전매매 정밀 대사 결과[/bold {status_color}]\n"
         f"[dim]대사 일시: {res.reconciled_at} | 대사 상태: [bold {status_color}]{res.status}[/bold {status_color}][/dim]",
