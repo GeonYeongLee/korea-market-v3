@@ -55,6 +55,9 @@ class DynamicFeatureProvider:
 
         self._stock_features_by_date: Dict[str, Dict[str, SymbolDynamicFeatures]] = {}
         self._index_features_by_date: Dict[str, IndexDynamicFeatures] = {}
+        self._sorted_stock_dates: list[str] = []
+        self._latest_settled_stock_date: Optional[str] = None
+        self._latest_settled_features: Dict[str, SymbolDynamicFeatures] = {}
         self._latest_index_date: Optional[str] = None
         self._is_loaded: bool = False
 
@@ -112,7 +115,33 @@ class DynamicFeatureProvider:
                         day_dict[s] = SymbolDynamicFeatures(prior_atr20_pct=float(a), prior_adto20=float(ad))
                 self._stock_features_by_date[d_str] = day_dict
 
-            logger.info(f"Loaded stock dynamic features for {len(self._stock_features_by_date)} trading dates.")
+            self._sorted_stock_dates = sorted(self._stock_features_by_date.keys())
+
+            # Point-in-Time EOD Settled snapshot per symbol:
+            # The unshifted settled metrics as of the latest completed bar in dataset.
+            # When trading on day T > latest_settled_stock_date (e.g. today in live trading),
+            # the prior metrics for day T are mathematically the unshifted settled EOD metrics of the latest completed bar!
+            df["eod_atr20_pct"] = (df["atr20"] / df["close"]).replace([np.inf, -np.inf], np.nan)
+            valid_last = df.dropna(subset=["eod_atr20_pct", "adto20", "close"])
+            if not valid_last.empty:
+                last_per_sym = valid_last.groupby("symbol", sort=False).last()
+                self._latest_settled_features = {}
+                for s, row in last_per_sym.iterrows():
+                    a = row["eod_atr20_pct"]
+                    ad = row["adto20"]
+                    if np.isfinite(a) and a > 0.0 and np.isfinite(ad) and ad > 0.0:
+                        self._latest_settled_features[str(s)] = SymbolDynamicFeatures(
+                            prior_atr20_pct=float(a), prior_adto20=float(ad)
+                        )
+                self._latest_settled_stock_date = str(last_per_sym["date_str"].max())
+            else:
+                self._latest_settled_features = {}
+                self._latest_settled_stock_date = None
+
+            logger.info(
+                f"Loaded stock dynamic features for {len(self._stock_features_by_date)} trading dates. "
+                f"Latest settled EOD date: {self._latest_settled_stock_date} ({len(self._latest_settled_features)} symbols)."
+            )
         except Exception as e:
             logger.warning(f"Failed to load stock features from {self.daily_file}: {e}")
 
@@ -176,21 +205,54 @@ class DynamicFeatureProvider:
             logger.warning(f"Failed to load index features from {self.index_file}: {e}")
 
     def get_stock_features(self, current_date: date | str, symbol: str) -> SymbolDynamicFeatures:
-        """Returns SymbolDynamicFeatures for symbol on current_date, with safe fallback."""
+        """
+        Returns SymbolDynamicFeatures for symbol on current_date, with Point-in-Time (As-Of) resolution.
+        If current_date is today (live trading) and not yet in the historical dataset,
+        it automatically resolves to the latest settled EOD values (T-1) without requiring today's row!
+        """
         if not self._is_loaded:
             self.load()
         d_str = self._to_date_str(current_date)
         day_dict = self._stock_features_by_date.get(d_str)
         if day_dict and symbol in day_dict:
             return day_dict[symbol]
+
+        # Point-in-Time Forward Lookup: If querying day T > latest completed date in file
+        if self._latest_settled_stock_date and d_str > self._latest_settled_stock_date:
+            if symbol in self._latest_settled_features:
+                return self._latest_settled_features[symbol]
+
+        # Point-in-Time Historical Lookup: If querying a weekend/holiday or date between historical dates
+        if self._sorted_stock_dates:
+            import bisect
+            idx = bisect.bisect_left(self._sorted_stock_dates, d_str)
+            if idx > 0:
+                prior_d = self._sorted_stock_dates[idx - 1]
+                if prior_d in self._stock_features_by_date and symbol in self._stock_features_by_date[prior_d]:
+                    return self._stock_features_by_date[prior_d][symbol]
+
         return SymbolDynamicFeatures(prior_atr20_pct=self.default_atr20_pct, prior_adto20=self.default_adto20)
 
     def get_day_stock_features(self, current_date: date | str) -> Dict[str, SymbolDynamicFeatures]:
-        """Returns full dictionary of symbol dynamic features for current_date."""
+        """Returns full dictionary of symbol dynamic features for current_date with Point-in-Time support."""
         if not self._is_loaded:
             self.load()
         d_str = self._to_date_str(current_date)
-        return self._stock_features_by_date.get(d_str, {})
+        if d_str in self._stock_features_by_date:
+            return self._stock_features_by_date[d_str]
+
+        # Point-in-Time Forward Lookup for live trading day
+        if self._latest_settled_stock_date and d_str > self._latest_settled_stock_date:
+            return self._latest_settled_features
+
+        if self._sorted_stock_dates:
+            import bisect
+            idx = bisect.bisect_left(self._sorted_stock_dates, d_str)
+            if idx > 0:
+                prior_d = self._sorted_stock_dates[idx - 1]
+                return self._stock_features_by_date.get(prior_d, {})
+
+        return {}
 
     def get_index_features(self, current_date: date | str) -> IndexDynamicFeatures:
         """Returns IndexDynamicFeatures for current_date, with safe fallback."""

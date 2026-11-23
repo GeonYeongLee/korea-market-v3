@@ -480,3 +480,52 @@ def test_rest_client_open_price_retry():
             assert call_count["0001"] == 2
             assert regime["ks_open"] == 2500.0
 
+
+def test_point_in_time_forward_lookup_without_today_row(tmp_path):
+    """
+    CRITICAL ARCHITECTURAL TEST:
+    Verifies that on live trading day T (e.g. Monday 2024-10-21),
+    DynamicFeatureProvider correctly resolves prior features from Friday's EOD (2024-10-18)
+    WITHOUT requiring Monday 2024-10-21 to exist as a row in the daily dataset!
+    """
+    # Create 25 trading days ending on Friday 2024-10-18
+    dates = pd.date_range("2024-09-13", "2024-10-18", freq="B")
+    data = []
+    base_p = 50000.0
+    for i, d in enumerate(dates):
+        c = base_p + i * 100.0
+        data.append({
+            "date": d.date(),
+            "symbol": "005930",
+            "open": c - 50.0,
+            "high": c + 100.0,
+            "low": c - 100.0,
+            "close": c,
+            "prev_close": c - 100.0 if i > 0 else c,
+            "turnover": 10_000_000_000.0 + i * 100_000_000.0,
+            "adto20": 10_000_000_000.0 + i * 100_000_000.0,
+        })
+    df = pd.DataFrame(data)
+    f = str(tmp_path / "daily_test.parquet")
+    df.to_parquet(f)
+
+    p = DynamicFeatureProvider(daily_file=f, index_file=str(tmp_path / "none.parquet"))
+    p.load()
+
+    # Verify latest settled date is 2024-10-18
+    assert p._latest_settled_stock_date == "2024-10-18"
+
+    # Query for NEXT MONDAY (2024-10-21) - which is NOT in daily_test.parquet!
+    feat_mon = p.get_stock_features("2024-10-21", "005930")
+    # Must NOT be fallback default! Must be valid calculated features!
+    assert feat_mon.prior_adto20 > 0.0
+    assert feat_mon.prior_adto20 != p.default_adto20
+    assert feat_mon.prior_atr20_pct > 0.0
+    assert feat_mon.prior_atr20_pct != p.default_atr20_pct
+
+    # Also test get_day_stock_features for Monday
+    day_feats = p.get_day_stock_features("2024-10-21")
+    assert "005930" in day_feats
+    assert day_feats["005930"] == feat_mon
+
+
