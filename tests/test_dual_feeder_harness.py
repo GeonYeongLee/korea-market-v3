@@ -26,8 +26,8 @@ class TestDualFeederScannerHarness(unittest.TestCase):
         # HTS returns only standard stock A
         self.mock_client.get_condition_search_result.return_value = [
             {
-                "code": "000001",
-                "name": "일반주",
+                "code": "005930",
+                "name": "삼성전자",
                 "open": "10000",
                 "price": "10400",
                 "low": "10000",
@@ -48,18 +48,18 @@ class TestDualFeederScannerHarness(unittest.TestCase):
         )
 
         promoted = scanner.scan_cycle()
-        self.assertEqual(promoted, ["000001"])
+        self.assertEqual(promoted, ["005930"])
         self.assertNotIn("000500", scanner._promoted_symbols)
         # Volume rank API should never be called
         self.mock_client.get_volume_rank.assert_not_called()
 
     def test_dual_feeder_captures_nxt_heavy_leader(self):
         """Dual Feeder rescues NXT heavy leader (e.g. 000500) that was absent from HTS condition search."""
-        # 1. HTS returns only 000001
+        # 1. HTS returns only 005930
         self.mock_client.get_condition_search_result.return_value = [
             {
-                "code": "000001",
-                "name": "일반주",
+                "code": "005930",
+                "name": "삼성전자",
                 "open": "10000",
                 "price": "10400",
                 "low": "10000",
@@ -75,22 +75,17 @@ class TestDualFeederScannerHarness(unittest.TestCase):
             {
                 "mksc_shrn_iscd": "000500",
                 "hts_kor_isnm": "가온전선",
+                "stck_prpr": "215000",
+                "stck_oprc": "207000",
+                "stck_hgpr": "217000",
+                "stck_lwpr": "206000",
+                "prdy_ctrt": "4.5",
                 "_tot_to": 70_000_000_000.0,
                 "_krx_to": 25_000_000_000.0,
                 "_nxt_to": 45_000_000_000.0,
                 "acml_vol": "350000",
             }
         ]
-
-        # 3. get_current_price('000500', market_div='J') returns regular market prices
-        self.mock_client.get_current_price.return_value = {
-            "stck_prpr": "215000",
-            "stck_oprc": "207000",  # +3.86% open gain
-            "stck_hgpr": "217000",
-            "stck_lwpr": "206000",  # -0.48% MAE (safe)
-            "prdy_ctrt": "4.5",
-            "rprs_mrkt_kor_name": "가온전선",
-        }
 
         scanner = RealtimeLeaderScanner(
             client=self.mock_client,
@@ -105,7 +100,7 @@ class TestDualFeederScannerHarness(unittest.TestCase):
         promoted = scanner.scan_cycle()
 
         # Both HTS stock and Volume Rank stock must be promoted
-        self.assertIn("000001", promoted)
+        self.assertIn("005930", promoted)
         self.assertIn("000500", promoted)
         self.assertEqual(len(promoted), 2)
         self.assertIn("000500", scanner._promoted_symbols)
@@ -118,11 +113,11 @@ class TestDualFeederScannerHarness(unittest.TestCase):
 
     def test_dual_feeder_deduplication_and_turnover_upgrade(self):
         """When a symbol appears in both HTS and UN Volume Rank, it is processed once without duplicate WebSocket promotions."""
-        # Symbol 000001 is returned by both feeds
+        # Symbol 005930 is returned by both feeds
         self.mock_client.get_condition_search_result.return_value = [
             {
-                "code": "000001",
-                "name": "일반주",
+                "code": "005930",
+                "name": "삼성전자",
                 "open": "10000",
                 "price": "10400",
                 "low": "10000",
@@ -135,8 +130,13 @@ class TestDualFeederScannerHarness(unittest.TestCase):
 
         self.mock_client.get_volume_rank.return_value = [
             {
-                "mksc_shrn_iscd": "000001",
-                "hts_kor_isnm": "일반주",
+                "mksc_shrn_iscd": "005930",
+                "hts_kor_isnm": "삼성전자",
+                "stck_prpr": "10400",
+                "stck_oprc": "10000",
+                "stck_hgpr": "10450",
+                "stck_lwpr": "10000",
+                "prdy_ctrt": "4.0",
                 "_tot_to": 3_000_000_000.0,  # 30억 (KRX + NXT)
                 "acml_vol": "300000",
             }
@@ -155,7 +155,7 @@ class TestDualFeederScannerHarness(unittest.TestCase):
         promoted = scanner.scan_cycle()
 
         # Should be promoted exactly once
-        self.assertEqual(promoted, ["000001"])
+        self.assertEqual(promoted, ["005930"])
         self.assertEqual(len(scanner._promoted_symbols), 1)
 
     def test_dual_feeder_filter_rejection_safety(self):
@@ -166,6 +166,11 @@ class TestDualFeederScannerHarness(unittest.TestCase):
             {
                 "mksc_shrn_iscd": "005930",
                 "hts_kor_isnm": "삼성전자",
+                "stck_prpr": "50250",
+                "stck_oprc": "50000",  # +0.5% gain
+                "stck_hgpr": "50500",
+                "stck_lwpr": "49800",
+                "prdy_ctrt": "0.5",
                 "_tot_to": 100_000_000_000.0,
                 "acml_vol": "2000000",
             },
@@ -173,6 +178,11 @@ class TestDualFeederScannerHarness(unittest.TestCase):
             {
                 "mksc_shrn_iscd": "000660",
                 "hts_kor_isnm": "SK하이닉스",
+                "stck_prpr": "105000",
+                "stck_oprc": "100000",  # +5% current gain
+                "stck_hgpr": "106000",
+                "stck_lwpr": "96000",   # -4% MAE breach!
+                "prdy_ctrt": "5.0",
                 "_tot_to": 80_000_000_000.0,
                 "acml_vol": "1500000",
             },

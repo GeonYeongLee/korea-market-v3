@@ -411,13 +411,6 @@ def main() -> None:
     check_parser.add_argument("--env", choices=["vts", "real"], default="vts", help="Environment to check (vts/real)")
     check_parser.add_argument("--skip-ws", action="store_true", help="Skip WebSocket connectivity handshake")
 
-    # reconcile
-    rec_parser = subparsers.add_parser("reconcile", help="Run post-market backtest vs live execution reconciliation")
-    rec_parser.add_argument("--date", default=None, help="Target date (YYYYMMDD or YYYY-MM-DD, default: today)")
-    rec_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    rec_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    rec_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
-
     args = parser.parse_args()
 
     if args.command == "strategies":
@@ -436,8 +429,6 @@ def main() -> None:
         cmd_routine(args)
     elif args.command == "check-live":
         cmd_check_live(args)
-    elif args.command == "reconcile":
-        cmd_reconcile(args)
     else:
         parser.print_help()
 

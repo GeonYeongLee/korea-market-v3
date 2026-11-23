@@ -124,7 +124,8 @@ def test_fallback_stop_execution_realism():
     exit_policy.on_position_opened(pos)
 
     # Bar 1 touches TP (+3.0% = 51,500) with High=51,600, but drops back and closes at 51,200 (< 51,500)
-    bar = MinuteBar("005930", datetime(2026, 6, 18, 9, 3), 50500.0, 51600.0, 50400.0, 51200.0, 10000)
+    # Low is set to 50,500 (> 50,400 midpoint SL) to avoid premature SL trip
+    bar = MinuteBar("005930", datetime(2026, 6, 18, 9, 3), 50500.0, 51600.0, 50500.0, 51200.0, 10000)
     sig = exit_policy.evaluate_exit(pos, bar)
 
     assert sig is not None
@@ -223,10 +224,10 @@ def test_hard_timeout_1521():
     pos = _create_position(avg_price=50000.0)
     exit_policy.on_position_opened(pos)
 
-    bar_pre = MinuteBar("005930", datetime(2026, 6, 18, 15, 20), 50500.0, 50600.0, 50400.0, 50500.0, 100)
+    bar_pre = MinuteBar("005930", datetime(2026, 6, 18, 15, 20), 50500.0, 50600.0, 50500.0, 50500.0, 100)
     assert exit_policy.evaluate_exit(pos, bar_pre) is None
 
-    bar_cutoff = MinuteBar("005930", datetime(2026, 6, 18, 15, 21), 50500.0, 50500.0, 50300.0, 50400.0, 100)
+    bar_cutoff = MinuteBar("005930", datetime(2026, 6, 18, 15, 21), 50500.0, 50500.0, 50500.0, 50500.0, 100)
     sig = exit_policy.evaluate_exit(pos, bar_cutoff)
     assert sig is not None
     assert sig.reason == "HARD_TIMEOUT_1521"
