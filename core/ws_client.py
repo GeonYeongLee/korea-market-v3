@@ -199,6 +199,12 @@ class KISWebSocketClient:
                         await self._ws.send(raw)
                     return
                 msg_cd = data.get("body", {}).get("msg_cd")
+                if msg_cd == "OPSP0011":
+                    logger.error("🚨 [WS Approval Key Invalid/Expired] KIS returned OPSP0011. Force refreshing approval key...")
+                    self.token_mgr.get_approval_key(force_refresh=True)
+                    if self._ws:
+                        await self._ws.close()
+                    return
                 output = data.get("body", {}).get("output", {})
                 if tr_id in ("H0STCNI0", "H0STCNI9") and output:
                     self._aes_iv = output.get("iv")
