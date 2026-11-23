@@ -223,7 +223,7 @@ class DailyRoutineOrchestrator:
             console.print(Panel.fit(
                 f"[bold yellow]⏭️ [STAGE 2 & 3 건너뜀] 당일 아침 주도주 진입 시간(09:00~{cutoff_str})이 이미 종료되었습니다.[/bold yellow]\n"
                 f"[cyan]현재 시각:[/cyan] {now.strftime('%H:%M:%S')} (진입 마감 시각: {cutoff_str}) | [cyan]보유 잔고:[/cyan] 0종목\n"
-                f"[green]✓ 신규 매매를 건너뛰고 대사(Reconciliation) 단계로 이동합니다.[/green]",
+                f"[green]✓ 신규 매매를 종료하고 일일 루틴 마감 단계로 이동합니다.[/green]",
                 border_style="yellow"
             ))
         elif max_slots == 0 and not open_pos:
@@ -366,27 +366,8 @@ class DailyRoutineOrchestrator:
 
                 console.print("[bold green]✓ 모든 실시간 API 호출이 완전히 차단되었습니다 (Zero API Idle 달성).[/bold green]\n")
 
-        # =====================================================================
-        # 당일 매매 백테스트 vs 실전 자동 대사 (Automated Daily Reconciliation)
-        # =====================================================================
-        try:
-            from engine.reconciliation import reconcile_daily_trading, display_reconciliation_table
-            console.print("\n[bold cyan]📊 당일 매매 백테스트 vs 실전 자동 대사 (Reconciliation) 분석을 수행합니다...[/bold cyan]")
-            rec_res = reconcile_daily_trading(
-                target_date=self.target_date,
-                scanner_name=self.scanner_name,
-                entry_name=self.entry_name,
-                exit_name=self.exit_name,
-                total_ticks=getattr(datafeed, "total_ticks_received", 0),
-                live_feed_healthy=(getattr(getattr(datafeed, "ws_client", None), "connection_state", "") != "AUTH_FAILED"),
-            )
-            display_reconciliation_table(rec_res)
-        except Exception as re:
-            logger.debug(f"Daily reconciliation skipped or failed: {re}")
-
         console.print(Panel.fit(
-            f"[bold green]✨ [ROUTINE COMPLETE] {self.target_date} 일일 퀀트 트레이딩 세션이 안전하게 종료되었습니다![/bold green]\n"
-            f"[dim]• 추가 대사가 필요한 경우: [bold yellow]python main.py reconcile --date {self.target_date}[/bold yellow][/dim]",
+            f"[bold green]✨ [ROUTINE COMPLETE] {self.target_date} 일일 퀀트 트레이딩 세션이 안전하게 종료되었습니다![/bold green]",
             border_style="green"
         ))
 

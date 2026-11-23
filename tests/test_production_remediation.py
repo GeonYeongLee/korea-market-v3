@@ -31,13 +31,7 @@ from engine.broker.kis_live import KisLiveBroker
 from engine.datafeed.kis_live import KisRealtimeFeed
 from engine.engine import TradingEngine
 from engine.clock import SimulatedClock
-from engine.reconciliation import (
-    parse_live_audit_log,
-    reconcile_daily_trading,
-    LiveTradeExecution,
-    SymbolReconciliationDetail,
-    ReconciliationResult,
-)
+
 
 
 # -------------------------------------------------------------------------
@@ -276,41 +270,7 @@ def test_kis_realtime_feed_40_cap_rejection():
     assert "999999" not in feed.active_symbols
 
 
-# -------------------------------------------------------------------------
-# Test 10: Reconciliation fee formula & exit slippage
-# -------------------------------------------------------------------------
-def test_reconciliation_exact_fee_formula():
-    entry_px = 50000.0
-    exit_px = 52000.0
-    shares = 100
 
-    entry_val = entry_px * shares  # 5,000,000
-    exit_val = exit_px * shares    # 5,200,000
-    gross_pnl = exit_val - entry_val  # 200,000
-
-    # Broker formula: (entry_val * 0.00014) + (exit_val * (0.00014 + 0.0018))
-    expected_cost = (entry_val * 0.00014) + (exit_val * 0.00194)
-    expected_net_pnl = gross_pnl - expected_cost
-
-    trade = LiveTradeExecution(
-        symbol="005930",
-        name="삼성전자",
-        has_trade=True,
-        shares=shares,
-        entry_px=entry_px,
-        exit_px=exit_px,
-        realized_pnl=0.0
-    )
-    trades_by_sym = {"005930": trade}
-
-    for sym, t in trades_by_sym.items():
-        if t.has_trade and t.realized_pnl == 0.0:
-            en = t.entry_px * t.shares
-            ex = t.exit_px * t.shares
-            cost = (en * 0.00014) + (ex * (0.00014 + 0.0018))
-            t.realized_pnl = (ex - en) - cost
-
-    assert abs(trade.realized_pnl - expected_net_pnl) < 1e-6
 
 
 # -------------------------------------------------------------------------

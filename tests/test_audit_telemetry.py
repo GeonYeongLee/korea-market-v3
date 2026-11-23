@@ -6,7 +6,6 @@ Verifies:
   2. Granular REST API & WebSocket message telemetry recording with secret masking.
   3. Strategy evaluation logging (Scanner, Entry, Exit) with complete numeric metrics.
   4. Execution lifecycle logging with order fill slippage (KRW and bp) and latencies.
-  5. Reconciliation engine parsing of telemetry logs and metric reporting.
 """
 import json
 import time
@@ -17,7 +16,6 @@ import pytest
 
 from core.telemetry_writer import AsyncJsonLinesWriter, mask_sensitive_dict
 from core.telemetry import TelemetryManager
-from engine.reconciliation import parse_telemetry_logs, reconcile_daily_trading
 
 
 def test_mask_sensitive_dict():
@@ -245,38 +243,7 @@ def test_telemetry_execution_lifecycle_and_slippage(tmp_path):
     assert records[2]["event_type"] == "ORDER_CANCELLED"
 
 
-def test_reconciliation_telemetry_parser(tmp_path):
-    """Verifies parse_telemetry_logs correctly computes scanner match, latency, and slippage."""
-    target_date = "20261110"
-    eval_file = tmp_path / "logs" / f"live_strategy_eval_{target_date}.jsonl"
-    exec_file = tmp_path / "logs" / f"live_executions_{target_date}.jsonl"
-    api_file = tmp_path / "logs" / f"live_api_{target_date}.jsonl"
-    eval_file.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(eval_file, "w", encoding="utf-8") as f:
-        f.write(json.dumps({"eval_type": "SCANNER", "symbol": "005930", "decision": "PASS"}) + "\n")
-        f.write(json.dumps({"eval_type": "SCANNER", "symbol": "000660", "decision": "REJECT", "reason": "LOW_TURNOVER"}) + "\n")
-        f.write(json.dumps({"eval_type": "ENTRY", "symbol": "005930", "decision": "PASS"}) + "\n")
-
-    with open(exec_file, "w", encoding="utf-8") as f:
-        f.write(json.dumps({"event_type": "ORDER_SUBMITTED", "order_no": "OD1", "timestamp": "2026-11-10T09:01:00.000"}) + "\n")
-        f.write(json.dumps({"event_type": "ORDER_FILLED", "order_no": "OD1", "slippage_bp": 12.5, "timestamp": "2026-11-10T09:01:00.050"}) + "\n")
-
-    with open(api_file, "w", encoding="utf-8") as f:
-        f.write(json.dumps({"channel": "REST", "latency_ms": 35.0, "status_code": 200, "rt_cd": "0"}) + "\n")
-        f.write(json.dumps({"channel": "REST", "latency_ms": 45.0, "status_code": 200, "rt_cd": "0"}) + "\n")
-        f.write(json.dumps({"channel": "WS", "frame_type": "TICK"}) + "\n")
-
-    with patch("engine.reconciliation.settings.logs_dir", tmp_path / "logs"):
-        diag = parse_telemetry_logs(target_date)
-
-    assert "005930" in diag["scanner_passed"]
-    assert "000660" not in diag["scanner_passed"]
-    assert diag["api_total_calls"] == 2
-    assert diag["api_avg_latency_ms"] == 40.0
-    assert diag["ws_frames_count"] == 1
-    assert diag["avg_slippage_bp"] == 12.5
-    assert diag["avg_execution_latency_ms"] == 50.0  # 50 ms difference
 
 
 def test_rest_client_telemetry_recording(tmp_path):
@@ -311,38 +278,5 @@ def test_rest_client_telemetry_recording(tmp_path):
     assert api_rec["latency_ms"] >= 0.0
 
 
-def test_reconciliation_stage0_feed_outage_gate(tmp_path):
-    """
-    Verifies Stage 0 Data Integrity Gate in reconciliation:
-    0 live trades due to feed outage/blackout MUST trigger CRITICAL_SYSTEM_OUTAGE,
-    while 0 live trades with healthy ticks produces NO_TRADE_MATCH.
-    """
-    from engine.reconciliation import reconcile_daily_trading
-    target_date = "20261120"
-    logs_dir = tmp_path / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("engine.reconciliation.settings.logs_dir", logs_dir), \
-         patch("engine.reconciliation.run_reconciliation_backtest", return_value=(None, [])):
-
-        # Case A: Live feed blackout (0 ticks, live_feed_healthy=False)
-        res_outage = reconcile_daily_trading(
-            target_date=target_date,
-            total_ticks=0,
-            live_feed_healthy=False,
-        )
-        assert res_outage.status == "CRITICAL_SYSTEM_OUTAGE"
-        assert any("CRITICAL_SYSTEM_OUTAGE" in c for c in res_outage.root_causes)
-        assert res_outage.items[0].metric == "데이터 피드 무결성 (Stage 0)"
-        assert res_outage.items[0].status == "DIFF"
-
-        # Case B: Normal observation (150 ticks received, no trades met conditions)
-        res_normal = reconcile_daily_trading(
-            target_date=target_date,
-            total_ticks=150,
-            live_feed_healthy=True,
-        )
-        assert res_normal.status == "NO_TRADE_MATCH"
-        assert res_normal.items[0].metric == "데이터 피드 무결성 (Stage 0)"
-        assert res_normal.items[0].status == "MATCH"
 

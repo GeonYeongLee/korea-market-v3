@@ -9,7 +9,6 @@ echo  - Stage 1: Wait for 09:00 regular market open ^& account sync
 echo  - Stage 2: 09:00~09:25 Real-time KIS condition scanner ^& breakout buy
 echo  - Stage 3: 09:00~ Dynamic SL ^& step-up TP / 15:20 EOD liquidation
 echo  - Stage 4: Zero API Idle complete shutdown after session
-echo  - Stage 5: Post-market backtest ^& reconciliation report
 echo ======================================================================
 echo.
 

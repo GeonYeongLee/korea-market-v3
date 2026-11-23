@@ -1,7 +1,7 @@
 """
 Unit Tests for Live System & CLI Extensions.
 Verifies CLI argument parsing, safety gates, RealtimeLeaderScanner callbacks,
-reconciliation utilities, and pre-flight helpers.
+and pre-flight helpers.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import pytest
 
 from data_pipeline.realtime_scanner import RealtimeLeaderScanner, parse_kis_minute_bars
 from check_live_readiness import mask_string
-from engine.reconciliation import is_regular_market_hours, is_real_kis_order_id, TradeComparisonItem
 from main import main
 
 
@@ -27,21 +26,7 @@ def test_mask_string():
     assert "*" in masked
 
 
-def test_is_regular_market_hours():
-    assert is_regular_market_hours("2026-11-10T09:05:00") is True
-    assert is_regular_market_hours("2026-11-10T15:20:00") is True
-    assert is_regular_market_hours("2026-11-10T08:59:59") is False
-    assert is_regular_market_hours("2026-11-10T15:31:00") is False
-    assert is_regular_market_hours("invalid_time") is False
 
-
-def test_is_real_kis_order_id():
-    assert is_real_kis_order_id("0002323300") is True
-    assert is_real_kis_order_id("12345678") is True
-    assert is_real_kis_order_id("ord_001") is False
-    assert is_real_kis_order_id("0000100123") is False
-    assert is_real_kis_order_id("") is False
-    assert is_real_kis_order_id(None) is False
 
 
 def test_parse_kis_minute_bars():
@@ -123,8 +108,8 @@ def test_realtime_leader_scanner_scan_cycle_filtering():
     mock_client.get_condition_search_result.return_value = [
         # Candidate 1: Meets all conditions (+4.0% gain, 15억 TO, low = open)
         {
-            "code": "000001",
-            "name": "종목1",
+            "code": "005930",
+            "name": "삼성전자",
             "open": "10000",
             "price": "10400",
             "low": "10000",
@@ -135,8 +120,8 @@ def test_realtime_leader_scanner_scan_cycle_filtering():
         },
         # Candidate 2: Rejected by low gain (+1.0%)
         {
-            "code": "000002",
-            "name": "종목2",
+            "code": "000660",
+            "name": "SK하이닉스",
             "open": "10000",
             "price": "10100",
             "low": "9950",
@@ -147,8 +132,8 @@ def test_realtime_leader_scanner_scan_cycle_filtering():
         },
         # Candidate 3: Rejected by turnover (2억)
         {
-            "code": "000003",
-            "name": "종목3",
+            "code": "035420",
+            "name": "NAVER",
             "open": "10000",
             "price": "10500",
             "low": "10000",
@@ -159,8 +144,8 @@ def test_realtime_leader_scanner_scan_cycle_filtering():
         },
         # Candidate 4: Rejected by MAE breach (low dropped -3%)
         {
-            "code": "000004",
-            "name": "종목4",
+            "code": "035720",
+            "name": "카카오",
             "open": "10000",
             "price": "10400",
             "low": "9700",  # -3%
@@ -184,9 +169,9 @@ def test_realtime_leader_scanner_scan_cycle_filtering():
 
     promoted = scanner.scan_cycle()
 
-    assert promoted == ["000001"]
-    assert "000001" in scanner._promoted_symbols
-    assert "000004" in scanner._mae_blacklisted
+    assert promoted == ["005930"]
+    assert "005930" in scanner._promoted_symbols
+    assert "035720" in scanner._mae_blacklisted
 
 
 def test_cli_live_safety_gate():
@@ -236,16 +221,4 @@ def test_cli_check_live_invocation():
             mock_check.assert_called_once_with(env_override="vts", skip_ws=True)
 
 
-def test_cli_reconcile_invocation():
-    """Verify `python main.py reconcile --date 20261110` calls reconcile_daily_trading."""
-    test_args = ["main.py", "reconcile", "--date", "20261110"]
-    with patch.object(sys, "argv", test_args):
-        with patch("engine.reconciliation.reconcile_daily_trading") as mock_rec, \
-             patch("engine.reconciliation.display_reconciliation_table"):
-            main()
-            mock_rec.assert_called_once_with(
-                target_date="20261110",
-                scanner_name="morning_leader",
-                entry_name="morning_breakout",
-                exit_name="morning_leader",
-            )
+

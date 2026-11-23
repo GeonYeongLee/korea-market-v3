@@ -329,18 +329,6 @@ def cmd_check_live(args: argparse.Namespace) -> None:
     sys.exit(0 if all_passed else 1)
 
 
-def cmd_reconcile(args: argparse.Namespace) -> None:
-    """Runs post-market backtest vs live execution reconciliation."""
-    from engine.reconciliation import reconcile_daily_trading, display_reconciliation_table
-    result = reconcile_daily_trading(
-        target_date=args.date,
-        scanner_name=args.scanner,
-        entry_name=args.entry,
-        exit_name=args.exit,
-    )
-    display_reconciliation_table(result)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Korea Market v3 Systematic Trading CLI")
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
