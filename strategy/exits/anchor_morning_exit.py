@@ -142,13 +142,16 @@ class AnchorMorningExit(IExitPolicy):
         b_close = tick.price if tick else (bar.close if bar else position.current_price)
 
         # 1. Hard Timeout Liquidation (15:20:00)
-        # For positions bought at 15:20 close betting, do not timeout on the entry day itself
+        # For positions bought at 15:20 close betting, do not exit on the entry day itself (must be held overnight)
         is_close_entry_day = (
             position.entry_dt is not None
             and eval_date == position.entry_dt.date()
             and position.entry_dt.time() >= time(15, 0)
         )
-        if not is_close_entry_day and eval_time >= self.hard_timeout:
+        if is_close_entry_day:
+            return None
+
+        if eval_time >= self.hard_timeout:
             return self._make_signal(position, eval_dt, b_close, "TIMEOUT_1520")
 
         is_overnight = (

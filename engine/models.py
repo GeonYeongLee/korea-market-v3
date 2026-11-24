@@ -102,6 +102,7 @@ class Order:
     status: OrderStatus = OrderStatus.PENDING
     tag: str = ""
     unfilled_quantity: Optional[int] = None
+    collar_cap_price: Optional[float] = None
 
 
 @dataclass(slots=True)

@@ -325,7 +325,11 @@ class CompositeStrategy(BaseStrategy):
                         else entry_signal.collar_cap_price
                     )
                     order_id = context.buy(
-                        symbol=bar.symbol, quantity=qty, price=buy_price, tag=entry_signal.reason
+                        symbol=bar.symbol,
+                        quantity=qty,
+                        price=buy_price,
+                        tag=entry_signal.reason,
+                        collar_cap_price=entry_signal.collar_cap_price,
                     )
                     if order_id and len(order_id) > 0:
                         self._daily_trade_count += 1

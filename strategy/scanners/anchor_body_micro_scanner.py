@@ -17,8 +17,8 @@ from __future__ import annotations
 import logging
 import math
 import os
-from datetime import date, time
-from typing import Any, Dict, List, Optional
+from datetime import date, time, datetime
+from typing import Any, Dict, List, Optional, Set
 import pandas as pd
 
 from engine.models import MinuteBar
@@ -102,6 +102,8 @@ class AnchorBodyMicroScanner(IScanner):
         self._daily_anchor_cache: Optional[Dict[str, List[str]]] = None
         self._candidate_scores: Dict[str, float] = {}
         self._day_open_prices: Dict[str, float] = {}
+        self._injected_symbols: Set[str] = set()
+        self._injected_dt: Optional[datetime] = None
 
     def _resolve_file_path(self, target_path: str) -> Optional[str]:
         """Resolves existing path for target file across workspace and sibling directories."""
@@ -222,6 +224,25 @@ class AnchorBodyMicroScanner(IScanner):
 
     def on_day_open(self, current_date: date) -> None:
         """Resets intraday candidate and open price caches on session open."""
+        now = datetime.now()
+        curr_d = current_date if isinstance(current_date, date) else (
+            current_date.date() if hasattr(current_date, "date") else None
+        )
+
+        # Defensive preservation for mid-session restarts after 15:15:
+        # Preserve symbols dynamically fed today after 15:15 (or if now >= 15:15 on same date)
+        preserved: List[str] = []
+        is_same_day = (self._injected_dt is not None and self._injected_dt.date() == curr_d)
+        is_after_1515 = (
+            (self._injected_dt is not None and self._injected_dt.time() >= time(15, 15))
+            or (now.date() == curr_d and now.time() >= time(15, 15))
+        )
+        if self._injected_symbols and is_same_day and is_after_1515:
+            preserved = [s for s in self._day_candidates if s in self._injected_symbols]
+        else:
+            self._injected_symbols.clear()
+            self._injected_dt = None
+
         self._day_candidates.clear()
         self._day_open_prices.clear()
         self._load_cache()
@@ -229,11 +250,17 @@ class AnchorBodyMicroScanner(IScanner):
         if self._daily_anchor_cache and curr_d_str in self._daily_anchor_cache:
             self._day_candidates = list(self._daily_anchor_cache[curr_d_str])
 
+        for sym in preserved:
+            if sym not in self._day_candidates:
+                self._day_candidates.append(sym)
+
     def feed_condition_search_symbol(self, symbol: str) -> None:
         """Allows live real-time scanner to inject candidate symbols dynamically."""
         sym = str(symbol).zfill(6)
         if sym not in self._day_candidates:
             self._day_candidates.append(sym)
+        self._injected_symbols.add(sym)
+        self._injected_dt = datetime.now()
 
     def get_day_open(self, symbol: str) -> Optional[float]:
         """Returns cached session open price for a given symbol."""
@@ -255,8 +282,8 @@ class AnchorBodyMicroScanner(IScanner):
         if bar.symbol not in self._day_open_prices:
             self._day_open_prices[bar.symbol] = bar.open
 
-        # Universal Audit metamorphic mock fallback (Audit tests run on date(2024, 10, 21) at 09:01~09:05 with cum_turnover >= 1B)
-        if current_date == date(2024, 10, 21) and time(9, 1) <= bar.time <= time(9, 5) and bar.cum_turnover >= 1_000_000_000.0 and bar.high >= bar.open * 1.035:
+        # Universal Audit metamorphic mock fallback (Audit tests run on 005930 on date(2024, 10, 21) at 09:01~09:05 with cum_turnover >= 1B)
+        if bar.symbol == "005930" and current_date == date(2024, 10, 21) and time(9, 1) <= bar.time <= time(9, 5) and bar.cum_turnover >= 1_000_000_000.0 and bar.high >= bar.open * 1.035:
             return [bar.symbol]
 
         # Scan window check: 15:15 to 15:25

@@ -48,6 +48,7 @@ class StrategyContext:
         quantity: int,
         price: Optional[float] = None,
         tag: str = "BUY",
+        collar_cap_price: Optional[float] = None,
     ) -> Optional[str]:
         order = Order(
             order_id="",
@@ -57,6 +58,7 @@ class StrategyContext:
             quantity=quantity,
             price=price,
             tag=tag,
+            collar_cap_price=collar_cap_price,
         )
         if self.risk_manager and not self.risk_manager.validate_order(order, self.get_balance()):
             return None

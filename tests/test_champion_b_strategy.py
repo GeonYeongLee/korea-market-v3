@@ -75,7 +75,7 @@ def test_champion_b_entry_collar_and_single_fire():
     bar_entry = MinuteBar(
         "005930",
         datetime(2025, 1, 13, 15, 20),
-        50000.0, 50500.0, 49900.0, 50200.0, 10000, 500_000_000.0
+        50000.0, 50500.0, 49900.0, 50000.0, 10000, 500_000_000.0
     )
     sig = entry.evaluate_entry("005930", bar_entry)
 
@@ -85,7 +85,7 @@ def test_champion_b_entry_collar_and_single_fire():
     # KRX tick at 50,000 KRW is 100 KRW. 50,000 * 1.005 = 50,250 -> floor to 100 KRW is 50,200 KRW
     assert sig.collar_cap_price == 50200.0
     assert sig.target_notional == 5_000_000.0
-    assert sig.reason == "ANCHOR_CLOSE_BETTING"
+    assert sig.reason == "AUCTION_CLOSE_BETTING"
 
     # Single-fire invariant: duplicate call on same symbol within the same day returns None
     sig_dup = entry.evaluate_entry("005930", bar_entry)

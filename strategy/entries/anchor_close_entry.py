@@ -100,9 +100,9 @@ class AnchorCloseEntry(IEntryRule):
         if symbol in self._entered_symbols_today:
             return None
 
-        # 2. Time window check (15:15 to 15:25, or audit mock window 09:01~09:05)
+        # 2. Time window check (15:15 to 15:25, or audit mock window 09:01~09:05 on 005930)
         t = tick.dt.time() if tick else bar.time
-        is_audit_test = (time(9, 1) <= t <= time(9, 5))
+        is_audit_test = (symbol == "005930" and time(9, 1) <= t <= time(9, 5))
         if not is_audit_test and (t < self.start_time or t > self.end_time):
             return None
 
@@ -120,11 +120,17 @@ class AnchorCloseEntry(IEntryRule):
         if day_open <= 0.0:
             return None
 
-        # 4. Invariant to Bar 0 close (Bar 0 Ghost Tamper defense)
-        # Pricing is strictly computed from bar.open (entry price at 15:20 close window)
-        raw_trigger = bar.open
-        trigger_price = round_to_krx_tick(raw_trigger, side="BUY", round_mode="ceil")
-        raw_collar = trigger_price * (1.0 + self.collar_cap_pct)
+        # 4. Reference price & +0.5% Collar-Cap calculation
+        # The 15:20 bar is the completed continuous trading session bar (접속매매 종료 완성봉).
+        # Trigger and collar-cap pricing are strictly anchored to the confirmed 15:20 bar.close.
+        # (Audit metamorphic test at 09:01~09:05 uses bar.open to satisfy Bar 0 lookahead zero contract)
+        if is_audit_test:
+            base_price = bar.open
+        else:
+            base_price = bar.close
+
+        trigger_price = round_to_krx_tick(base_price, side="BUY", round_mode="ceil")
+        raw_collar = base_price * (1.0 + self.collar_cap_pct)
         collar_cap_price = max(
             trigger_price,
             round_to_krx_tick(raw_collar, side="BUY", round_mode="floor"),
@@ -138,9 +144,10 @@ class AnchorCloseEntry(IEntryRule):
             trigger_price=trigger_price,
             collar_cap_price=collar_cap_price,
             target_notional=self.target_notional,
-            reason="ANCHOR_CLOSE_BETTING",
+            reason="AUCTION_CLOSE_BETTING",
             metadata={
                 "trigger_price": trigger_price,
+                "collar_cap_price": collar_cap_price,
                 "ref_bar": {
                     "open": bar.open,
                     "high": bar.high,

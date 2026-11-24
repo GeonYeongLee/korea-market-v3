@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, date, time
 from typing import Dict, List, Optional, Callable
 
 from core.krx_ticks import round_to_krx_tick
@@ -45,6 +45,7 @@ class BacktestBroker(IBroker):
         self._lock = threading.RLock()
         self.positions: Dict[str, Position] = {}
         self.pending_orders: Dict[str, Order] = {}
+        self._pending_auction_orders: List[Order] = []
         self.latest_prices: Dict[str, float] = {}
         self.current_dt: Optional[datetime] = None
 
@@ -109,6 +110,10 @@ class BacktestBroker(IBroker):
     def on_bar(self, bar: MinuteBar) -> None:
         """Updates symbol close price, current datetime, and position watermarks."""
         with self._lock:
+            if self.current_dt is not None and bar.dt.date() != self.current_dt.date():
+                self.on_day_close(self.current_dt.date())
+                self.on_day_open(bar.dt.date())
+
             self.latest_prices[bar.symbol] = bar.close
             self.current_dt = bar.dt
             if bar.symbol in self.positions:
@@ -119,12 +124,68 @@ class BacktestBroker(IBroker):
                 if pos.low_water_mark == 0.0 or bar.low < pos.low_water_mark:
                     pos.low_water_mark = bar.low
 
+            # Process 15:30 closing auction delayed fills (single-price clearing)
+            if self._pending_auction_orders and bar.time == time(15, 30):
+                matching_orders = [ord_ for ord_ in self._pending_auction_orders if ord_.symbol == bar.symbol]
+                for order in matching_orders:
+                    self._pending_auction_orders.remove(order)
+                    collar_cap = getattr(order, "collar_cap_price", None)
+                    if collar_cap is None or collar_cap <= 0:
+                        base_p = order.price or bar.close
+                        collar_cap = round_to_krx_tick(base_p * 1.005, side="BUY", round_mode="floor")
+
+                    if bar.close <= collar_cap:
+                        # Single-price closing auction fill with 0.0% slippage
+                        fill_price = round_to_krx_tick(bar.close, side="BUY", round_mode="ceil")
+                        trade_amount = fill_price * order.quantity
+                        commission = trade_amount * self.commission_rate
+                        if order.side == OrderSide.BUY and self.cash < (trade_amount + commission):
+                            order.status = OrderStatus.REJECTED
+                            self._emit_event(
+                                OrderEvent(
+                                    order_id=order.order_id,
+                                    symbol=order.symbol,
+                                    side=order.side,
+                                    status=OrderStatus.REJECTED,
+                                    filled_price=0.0,
+                                    filled_quantity=0,
+                                    dt=self.current_dt,
+                                    message="REJECTED_INSUFFICIENT_FUNDS",
+                                )
+                            )
+                        else:
+                            self._fill_order(order, fill_price)
+                            logger.info(
+                                f"🏁 [AUCTION FILLED] {order.symbol} filled at 15:30 single-price: "
+                                f"{fill_price:,.0f} KRW (Cap: {collar_cap:,.0f} KRW, Qty: {order.quantity})"
+                            )
+                    else:
+                        order.status = OrderStatus.REJECTED
+                        self._emit_event(
+                            OrderEvent(
+                                order_id=order.order_id,
+                                symbol=order.symbol,
+                                side=order.side,
+                                status=OrderStatus.REJECTED,
+                                filled_price=0.0,
+                                filled_quantity=0,
+                                dt=self.current_dt,
+                                message="COLLAR_CAP_EXCEEDED",
+                            )
+                        )
+                        logger.warning(
+                            f"🚫 [AUCTION REJECTED] {order.symbol} price {bar.close:,.0f} KRW "
+                            f"> Collar Cap {collar_cap:,.0f} KRW (COLLAR_CAP_EXCEEDED)"
+                        )
+
     # -------------------------------------------------------------------------
     # Order Execution & Microstructure Simulation
     # -------------------------------------------------------------------------
     def submit_order(self, order: Order) -> str:
         """
-        Simulates immediate bar/tick execution with KRX adverse slippage and fee deduction.
+        Simulates order execution with KRX microstructure:
+          - If tag has AUCTION/CLOSE and time >= 15:20: queues for 15:30 closing auction delayed fill.
+          - Otherwise: immediate execution with KRX adverse slippage and fee deduction.
         Enforces statutory tick rounding:
           - BUY: ceil rounding (+slippage)
           - SELL: floor rounding (-slippage)
@@ -135,6 +196,64 @@ class BacktestBroker(IBroker):
             order.created_at = self.current_dt or datetime.now()
 
         with self._lock:
+            # Check for 15:20+ closing auction delayed fill order
+            tag_upper = (order.tag or "").upper()
+            is_auction_tag = ("AUCTION" in tag_upper) or ("CLOSE" in tag_upper)
+            order_time = (
+                order.created_at.time()
+                if order.created_at
+                else (self.current_dt.time() if self.current_dt else time(0, 0))
+            )
+            is_after_1520 = order_time >= time(15, 20)
+
+            if is_auction_tag and is_after_1520:
+                collar_cap = getattr(order, "collar_cap_price", None)
+                if collar_cap is None or collar_cap <= 0:
+                    base_p = order.price or self.latest_prices.get(order.symbol, 0.0)
+                    collar_cap = round_to_krx_tick(base_p * 1.005, side="BUY", round_mode="floor") if base_p > 0 else 0.0
+
+                if collar_cap <= 0:
+                    order.status = OrderStatus.REJECTED
+                    self._emit_event(
+                        OrderEvent(
+                            order_id=order.order_id,
+                            symbol=order.symbol,
+                            side=order.side,
+                            status=OrderStatus.REJECTED,
+                            filled_price=0.0,
+                            filled_quantity=0,
+                            dt=self.current_dt,
+                            message="REJECTED_ZERO_PRICE",
+                        )
+                    )
+                    return order.order_id
+
+                est_cost = collar_cap * order.quantity
+                est_commission = est_cost * self.commission_rate
+                if order.side == OrderSide.BUY and self.cash < (est_cost + est_commission):
+                    order.status = OrderStatus.REJECTED
+                    self._emit_event(
+                        OrderEvent(
+                            order_id=order.order_id,
+                            symbol=order.symbol,
+                            side=order.side,
+                            status=OrderStatus.REJECTED,
+                            filled_price=0.0,
+                            filled_quantity=0,
+                            dt=self.current_dt,
+                            message="REJECTED_INSUFFICIENT_FUNDS",
+                        )
+                    )
+                    return order.order_id
+
+                order.status = OrderStatus.PENDING
+                self._pending_auction_orders.append(order)
+                logger.info(
+                    f"⏳ [AUCTION PENDING] Queued closing auction order: {order.symbol} "
+                    f"Qty: {order.quantity} | Collar Cap: {collar_cap:,.0f} KRW | OrderID: {order.order_id}"
+                )
+                return order.order_id
+
             base_price = order.price or self.latest_prices.get(order.symbol, 0.0)
             if base_price <= 0:
                 order.status = OrderStatus.REJECTED
@@ -186,7 +305,7 @@ class BacktestBroker(IBroker):
             return order.order_id
 
     def cancel_order(self, order_id: str) -> bool:
-        """Cancels an order from pending orders."""
+        """Cancels an order from pending orders or pending auction orders."""
         with self._lock:
             if order_id in self.pending_orders:
                 ord_ = self.pending_orders.pop(order_id)
@@ -204,19 +323,65 @@ class BacktestBroker(IBroker):
                     )
                 )
                 return True
+            for i, ord_ in enumerate(self._pending_auction_orders):
+                if ord_.order_id == order_id:
+                    self._pending_auction_orders.pop(i)
+                    ord_.status = OrderStatus.CANCELLED
+                    self._emit_event(
+                        OrderEvent(
+                            order_id=ord_.order_id,
+                            symbol=ord_.symbol,
+                            side=ord_.side,
+                            status=OrderStatus.CANCELLED,
+                            filled_price=0.0,
+                            filled_quantity=0,
+                            dt=self.current_dt,
+                            message="CANCELLED",
+                        )
+                    )
+                    return True
         return False
 
     def cancel_pending_orders(self, symbol: Optional[str] = None) -> List[str]:
         """Cancels all active pending orders, optionally filtered by symbol."""
         with self._lock:
             pending_list = list(self.pending_orders.items())
+            auction_list = list(self._pending_auction_orders)
 
         cancelled_ids: List[str] = []
         for ord_id, ord_ in pending_list:
             if symbol is None or ord_.symbol == symbol:
                 if self.cancel_order(ord_id):
                     cancelled_ids.append(ord_id)
+        for ord_ in auction_list:
+            if symbol is None or ord_.symbol == symbol:
+                if self.cancel_order(ord_.order_id):
+                    cancelled_ids.append(ord_.order_id)
         return cancelled_ids
+
+    def on_day_close(self, current_date: Optional[date] = None) -> None:
+        """Flushes remaining pending auction orders and clears queue at day close."""
+        with self._lock:
+            while self._pending_auction_orders:
+                order = self._pending_auction_orders.pop(0)
+                order.status = OrderStatus.CANCELLED
+                self._emit_event(
+                    OrderEvent(
+                        order_id=order.order_id,
+                        symbol=order.symbol,
+                        side=order.side,
+                        status=OrderStatus.CANCELLED,
+                        filled_price=0.0,
+                        filled_quantity=0,
+                        dt=self.current_dt,
+                        message="EXPIRED_EOD_UNFILLED",
+                    )
+                )
+
+    def on_day_open(self, current_date: Optional[date] = None) -> None:
+        """Initializes state for new trading day."""
+        with self._lock:
+            self._pending_auction_orders.clear()
 
     def _fill_order(self, order: Order, fill_price: float) -> None:
         """Internal order fill logic updating cash, positions, and recording completed trades."""

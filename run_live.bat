@@ -6,8 +6,9 @@ cd /d "%~dp0"
 echo ======================================================================
 echo  [WARNING: REAL CASH LIVE TRADING]
 echo  Orders will be executed on real brokerage account with REAL MONEY!
-echo  Strategy: Korea Market v3 Composite Strategy (Morning Breakout)
-echo  Capital: 10,000,000 KRW (Fixed Single Notional, 15:20 EOD Liquidated)
+echo  Strategy: Korea Market v3 Champion B (Close-to-Open 종가매수 시가매도)
+echo  Components: champion_b / anchor_close / anchor_morning
+echo  Capital: 10,000,000 KRW (Fixed Single Notional)
 echo ======================================================================
 echo.
 set /p CONFIRM="Are you sure you want to start REAL CASH trading? (Type YES to proceed): "

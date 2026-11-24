@@ -56,9 +56,9 @@ class DailyRoutineOrchestrator:
         self,
         mode: str = "mock",
         target_date: Optional[str] = None,
-        scanner_name: str = "morning_leader",
-        entry_name: str = "morning_breakout",
-        exit_name: str = "morning_leader",
+        scanner_name: str = "champion_b",
+        entry_name: str = "anchor_close",
+        exit_name: str = "anchor_morning",
         capital: float = 10_000_000.0,
     ):
         self.mode = mode.lower()
@@ -347,9 +347,9 @@ class DailyRoutineOrchestrator:
 def main():
     parser = argparse.ArgumentParser(description="Korea Market v3 - Full Day Trading Routine Orchestrator")
     parser.add_argument("--mode", type=str, choices=["mock", "live"], default="mock", help="Trading mode: mock (VTS) or live (REAL)")
-    parser.add_argument("--scanner", type=str, default="morning_leader", help="Scanner module name")
-    parser.add_argument("--entry", type=str, default="morning_breakout", help="Entry module name")
-    parser.add_argument("--exit", type=str, default="morning_leader", help="Exit module name")
+    parser.add_argument("--scanner", type=str, default="champion_b", help="Scanner module name (default: champion_b)")
+    parser.add_argument("--entry", type=str, default="anchor_close", help="Entry module name (default: anchor_close)")
+    parser.add_argument("--exit", type=str, default="anchor_morning", help="Exit module name (default: anchor_morning)")
     parser.add_argument("--date", type=str, default=datetime.now().strftime("%Y%m%d"), help="Target date YYYYMMDD")
     parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial trading capital in KRW")
     parser.add_argument("--nowait", action="store_true", help="Skip waiting for 09:00 market open")

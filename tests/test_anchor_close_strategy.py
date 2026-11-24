@@ -10,7 +10,9 @@ from __future__ import annotations
 from datetime import datetime, time, date
 import pytest
 
-from engine.models import MinuteBar, Position, OrderType
+from engine.models import MinuteBar, Position, OrderType, Order, OrderSide, OrderStatus
+from engine.broker.backtest import BacktestBroker
+from strategy.scanners.anchor_body_micro_scanner import AnchorBodyMicroScanner
 from strategy.scanners.anchor_close_scanner import AnchorCloseScanner
 from strategy.entries.anchor_close_entry import AnchorCloseEntry
 from strategy.exits.anchor_morning_exit import AnchorMorningExit
@@ -44,8 +46,8 @@ def test_anchor_close_entry_execution_and_collar():
     entry = AnchorCloseEntry(collar_cap_pct=0.005, target_notional=10_000_000.0)
     entry.on_day_open(date(2025, 1, 13))
 
-    # Entry at 15:20 on symbol 005930 at open price 50,000 KRW
-    bar_entry = MinuteBar("005930", datetime(2025, 1, 13, 15, 20), 50000.0, 50500.0, 49900.0, 50200.0, 10000, 500_000_000.0)
+    # Entry at 15:20 on symbol 005930 at close price 50,000 KRW
+    bar_entry = MinuteBar("005930", datetime(2025, 1, 13, 15, 20), 50000.0, 50500.0, 49900.0, 50000.0, 10000, 500_000_000.0)
     sig = entry.evaluate_entry("005930", bar_entry)
 
     assert sig is not None
@@ -53,7 +55,7 @@ def test_anchor_close_entry_execution_and_collar():
     assert sig.trigger_price == 50000.0
     # KRX tick at 50,000 is 100 KRW. 50,000 * 1.005 = 50,250 -> floor to 100 KRW tick is 50,200 KRW
     assert sig.collar_cap_price == 50200.0
-    assert sig.reason == "ANCHOR_CLOSE_BETTING"
+    assert sig.reason == "AUCTION_CLOSE_BETTING"
 
     # Single-fire invariant: second call on same symbol returns None
     sig_dup = entry.evaluate_entry("005930", bar_entry)
@@ -197,3 +199,119 @@ def test_anchor_conditional_5_slots_universal_strategy_audit():
     assert report.total_checks == 14
     assert report.passed_checks == 14
     assert report.passed is True
+
+
+def test_backtest_broker_closing_auction_delayed_fill():
+    """Verifies that BacktestBroker delays execution of 15:20 AUCTION order until 15:30 single-price auction."""
+    broker = BacktestBroker(initial_capital=10_000_000.0)
+    broker.on_day_open(date(2025, 1, 13))
+
+    bar_1520 = MinuteBar(
+        "005930",
+        datetime(2025, 1, 13, 15, 20),
+        50000.0, 50200.0, 49900.0, 50000.0, 10000, 500_000_000.0
+    )
+    broker.on_bar(bar_1520)
+
+    # Submit AUCTION order at 15:20 with collar cap 50,200 KRW
+    order = Order(
+        order_id="AUCT_001",
+        symbol="005930",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=100,
+        price=50000.0,
+        tag="AUCTION_CLOSE_BETTING",
+        created_at=datetime(2025, 1, 13, 15, 20),
+        collar_cap_price=50200.0,
+    )
+    order_id = broker.submit_order(order)
+    assert order_id == "AUCT_001"
+    assert order.status == OrderStatus.PENDING
+    assert len(broker._pending_auction_orders) == 1
+    assert broker.get_position("005930") is None  # Not filled yet!
+
+    # 15:25 bar: still pending
+    bar_1525 = MinuteBar(
+        "005930",
+        datetime(2025, 1, 13, 15, 25),
+        50000.0, 50100.0, 49950.0, 50000.0, 5000, 250_000_000.0
+    )
+    broker.on_bar(bar_1525)
+    assert order.status == OrderStatus.PENDING
+    assert broker.get_position("005930") is None
+
+    # 15:30 single-price closing auction bar at 50,100 KRW (<= collar cap 50,200 KRW)
+    bar_1530 = MinuteBar(
+        "005930",
+        datetime(2025, 1, 13, 15, 30),
+        50100.0, 50100.0, 50100.0, 50100.0, 20000, 1_002_000_000.0
+    )
+    broker.on_bar(bar_1530)
+
+    # Must be FILLED at exact 15:30 close price 50,100 KRW (0.0% slippage)
+    assert order.status == OrderStatus.FILLED
+    assert len(broker._pending_auction_orders) == 0
+    pos = broker.get_position("005930")
+    assert pos is not None
+    assert pos.quantity == 100
+    assert pos.avg_price == 50100.0  # Zero slippage single-price auction execution!
+
+
+def test_backtest_broker_closing_auction_collar_cap_exceeded_rejection():
+    """Verifies that BacktestBroker rejects AUCTION order if 15:30 close > collar_cap_price."""
+    broker = BacktestBroker(initial_capital=10_000_000.0)
+    broker.on_day_open(date(2025, 1, 13))
+
+    bar_1520 = MinuteBar(
+        "005930",
+        datetime(2025, 1, 13, 15, 20),
+        50000.0, 50100.0, 49900.0, 50000.0, 10000, 500_000_000.0
+    )
+    broker.on_bar(bar_1520)
+
+    order = Order(
+        order_id="AUCT_002",
+        symbol="005930",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=100,
+        price=50000.0,
+        tag="AUCTION_CLOSE_BETTING",
+        created_at=datetime(2025, 1, 13, 15, 20),
+        collar_cap_price=50200.0,  # Cap is +0.4%
+    )
+    broker.submit_order(order)
+    assert len(broker._pending_auction_orders) == 1
+
+    # 15:30 auction surges to 50,600 KRW (> collar cap 50,200 KRW)
+    bar_1530 = MinuteBar(
+        "005930",
+        datetime(2025, 1, 13, 15, 30),
+        50600.0, 50600.0, 50600.0, 50600.0, 20000, 1_012_000_000.0
+    )
+    broker.on_bar(bar_1530)
+
+    # Must be REJECTED with COLLAR_CAP_EXCEEDED
+    assert order.status == OrderStatus.REJECTED
+    assert len(broker._pending_auction_orders) == 0
+    assert broker.get_position("005930") is None
+
+
+def test_anchor_body_micro_scanner_preserves_afternoon_candidates_on_reopen():
+    """Verifies that AnchorBodyMicroScanner defends candidates fed after 15:15 across on_day_open restarts."""
+    scanner = AnchorBodyMicroScanner()
+    today = date(2025, 1, 13)
+
+    # Feed candidate dynamically after 15:15
+    scanner.feed_condition_search_symbol("005930")
+    scanner._injected_dt = datetime(2025, 1, 13, 15, 16, 0)
+
+    # Mid-session restart / on_day_open today
+    scanner.on_day_open(today)
+    assert "005930" in scanner._day_candidates
+
+    # Next day on_day_open: should be cleanly cleared
+    tomorrow = date(2025, 1, 14)
+    scanner.on_day_open(tomorrow)
+    assert "005930" not in scanner._day_candidates

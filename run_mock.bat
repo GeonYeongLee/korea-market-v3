@@ -3,7 +3,12 @@ setlocal
 title Korea Market v3 - MOCK TRADING (VTS)
 cd /d "%~dp0"
 
-echo [INFO] Starting Mock Paper Trading (VTS) with Korea Market v3...
+echo ======================================================================
+echo  [MOCK TRADING (VTS)] Korea Market v3 Paper Trading
+echo  Strategy: Champion B 종가매수 시가매도 (champion_b / anchor_close / anchor_morning)
+echo  Capital: 10,000,000 KRW
+echo ======================================================================
+echo.
 
 set PYTHON_CMD=py -3.12
 where py >nul 2>nul

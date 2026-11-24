@@ -5,11 +5,12 @@ cd /d "%~dp0"
 
 echo ======================================================================
 echo  [DAILY ROUTINE] Korea Market v3 Automated Trading Routine (MOCK)
-echo  - Stage 1: Wait for 09:00 regular market open ^& account sync
-echo  - Stage 2: 09:00~09:25 Real-time KIS condition scanner ^& breakout buy
-echo  - Stage 3: 09:00~ Dynamic SL ^& step-up TP / 15:20 EOD liquidation
-echo  - Stage 4: Zero API Idle complete shutdown after session
-echo  - Stage 5: Post-market backtest ^& reconciliation report
+echo  - Default Strategy: Champion B 종가매수 시가매도
+echo  - Stage 1: 08:30~09:00 장개시전 동시호가 시가청산 / 09:00 정규장 개장 동기화
+echo  - Stage 2: 15:15~15:30 실시간 주도주 종가베팅 발굴 및 매수 체결
+echo  - Stage 3: 15:30 장마감 동시호가 체결 및 오버나잇 잔고 확정
+echo  - Stage 4: Zero API Idle 완전 차단 안전 종료
+echo  - Stage 5: Post-market 백테스트 vs 실전 자동 대사(Reconciliation)
 echo ======================================================================
 echo.
 

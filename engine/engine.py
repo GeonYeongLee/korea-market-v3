@@ -84,6 +84,18 @@ class TradingEngine:
         if (current_dt.time() > cutoff_time or strat_completed) and has_positions:
             return False, set(broker_positions.keys())
 
+        # High-performance coordinated afternoon pushdown: load only active positions and candidate stocks
+        if current_dt.time() > time(9, 30):
+            strat_cands: Set[str] = set()
+            scanner = getattr(self.strategy, "scanner", None)
+            if scanner and hasattr(scanner, "filter_universe"):
+                u_list = scanner.filter_universe(current_dt.date())
+                if u_list:
+                    strat_cands.update(u_list)
+            if strat_cands or has_positions:
+                return False, set(broker_positions.keys()) | strat_cands
+            return True, None
+
         # Standard morning scanning & entry window: stream all universe symbols
         return False, None
 

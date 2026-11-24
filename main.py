@@ -345,9 +345,9 @@ def main() -> None:
 
     # backtest
     bt_parser = subparsers.add_parser("backtest", help="Run deterministic pure 1-minute bar backtest")
-    bt_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    bt_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    bt_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    bt_parser.add_argument("--scanner", default="champion_b", help="Scanner module name (default: champion_b)")
+    bt_parser.add_argument("--entry", default="anchor_close", help="Entry module name (default: anchor_close)")
+    bt_parser.add_argument("--exit", default="anchor_morning", help="Exit module name (default: anchor_morning)")
     bt_parser.add_argument("--start", default="2026-01-02", help="Start date (YYYY-MM-DD or YYYYMMDD, default: 2026-01-02)")
     bt_parser.add_argument("--end", default="2026-11-02", help="End date (YYYY-MM-DD or YYYYMMDD, default: 2026-11-02)")
     bt_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW (default: 10,000,000)")
@@ -370,9 +370,9 @@ def main() -> None:
 
     # audit
     audit_parser = subparsers.add_parser("audit", help="Run Universal Strategy Contract Suite audit")
-    audit_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    audit_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    audit_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    audit_parser.add_argument("--scanner", default="champion_b", help="Scanner module name (default: champion_b)")
+    audit_parser.add_argument("--entry", default="anchor_close", help="Entry module name (default: anchor_close)")
+    audit_parser.add_argument("--exit", default="anchor_morning", help="Exit module name (default: anchor_morning)")
     audit_parser.add_argument(
         "--ambiguity-mode",
         choices=["pessimistic", "optimistic"],
@@ -388,18 +388,18 @@ def main() -> None:
 
     # mock
     mock_parser = subparsers.add_parser("mock", help="Run live mock paper trading on KIS VTS")
-    mock_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    mock_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    mock_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    mock_parser.add_argument("--scanner", default="champion_b", help="Scanner module name (default: champion_b)")
+    mock_parser.add_argument("--entry", default="anchor_close", help="Entry module name (default: anchor_close)")
+    mock_parser.add_argument("--exit", default="anchor_morning", help="Exit module name (default: anchor_morning)")
     mock_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW")
     mock_parser.add_argument("--nowait", action="store_true", help="Skip waiting for 09:00 market open")
 
     # live
     live_parser = subparsers.add_parser("live", help="Run live cash trading on KIS REAL (requires --yes)")
     live_parser.add_argument("--yes", action="store_true", help="Confirm real cash execution safety gate")
-    live_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    live_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    live_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    live_parser.add_argument("--scanner", default="champion_b", help="Scanner module name (default: champion_b)")
+    live_parser.add_argument("--entry", default="anchor_close", help="Entry module name (default: anchor_close)")
+    live_parser.add_argument("--exit", default="anchor_morning", help="Exit module name (default: anchor_morning)")
     live_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW")
     live_parser.add_argument("--nowait", action="store_true", help="Skip waiting for 09:00 market open")
 
@@ -408,9 +408,9 @@ def main() -> None:
     routine_parser.add_argument("--mode", choices=["mock", "live"], default="mock", help="Trading mode (mock/live)")
     routine_parser.add_argument("--yes", action="store_true", help="Confirm real money execution for live mode")
     routine_parser.add_argument("--date", default=None, help="Target date YYYYMMDD")
-    routine_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    routine_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    routine_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    routine_parser.add_argument("--scanner", default="champion_b", help="Scanner module name (default: champion_b)")
+    routine_parser.add_argument("--entry", default="anchor_close", help="Entry module name (default: anchor_close)")
+    routine_parser.add_argument("--exit", default="anchor_morning", help="Exit module name (default: anchor_morning)")
     routine_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW")
     routine_parser.add_argument("--nowait", action="store_true", help="Skip waiting for 09:00 market open")
 
@@ -422,9 +422,9 @@ def main() -> None:
     # reconcile
     rec_parser = subparsers.add_parser("reconcile", help="Run post-market backtest vs live execution reconciliation")
     rec_parser.add_argument("--date", default=None, help="Target date (YYYYMMDD or YYYY-MM-DD, default: today)")
-    rec_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    rec_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    rec_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    rec_parser.add_argument("--scanner", default="champion_b", help="Scanner module name (default: champion_b)")
+    rec_parser.add_argument("--entry", default="anchor_close", help="Entry module name (default: anchor_close)")
+    rec_parser.add_argument("--exit", default="anchor_morning", help="Exit module name (default: anchor_morning)")
 
     args = parser.parse_args()
 

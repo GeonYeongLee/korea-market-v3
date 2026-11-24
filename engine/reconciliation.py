@@ -389,9 +389,9 @@ def parse_telemetry_logs(date_compact: str) -> Dict[str, Any]:
 
 def run_reconciliation_backtest(
     target_date: str,
-    scanner_name: str = "morning_leader",
-    entry_name: str = "morning_breakout",
-    exit_name: str = "morning_leader",
+    scanner_name: str = "champion_b",
+    entry_name: str = "anchor_close",
+    exit_name: str = "anchor_morning",
     capital: float = 10_000_000.0,
     data_dir: Optional[str] = None,
 ) -> Tuple[Optional[Any], List[Any]]:
@@ -448,9 +448,9 @@ def run_reconciliation_backtest(
 
 def reconcile_daily_trading(
     target_date: Optional[str] = None,
-    scanner_name: str = "morning_leader",
-    entry_name: str = "morning_breakout",
-    exit_name: str = "morning_leader",
+    scanner_name: str = "champion_b",
+    entry_name: str = "anchor_close",
+    exit_name: str = "anchor_morning",
     strategy_name: Optional[str] = None,
 ) -> ReconciliationResult:
     """
@@ -813,9 +813,9 @@ def display_reconciliation_table(res: ReconciliationResult) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Korea Market v3 - Backtest vs Live Reconciliation")
     parser.add_argument("--date", type=str, default=datetime.now().strftime("%Y%m%d"), help="Target date YYYYMMDD")
-    parser.add_argument("--scanner", type=str, default="morning_leader", help="Scanner module (default: morning_leader)")
-    parser.add_argument("--entry", type=str, default="morning_breakout", help="Entry module (default: morning_breakout)")
-    parser.add_argument("--exit", type=str, default="morning_leader", help="Exit module (default: morning_leader)")
+    parser.add_argument("--scanner", type=str, default="champion_b", help="Scanner module (default: champion_b)")
+    parser.add_argument("--entry", type=str, default="anchor_close", help="Entry module (default: anchor_close)")
+    parser.add_argument("--exit", type=str, default="anchor_morning", help="Exit module (default: anchor_morning)")
     args = parser.parse_args()
 
     result = reconcile_daily_trading(
