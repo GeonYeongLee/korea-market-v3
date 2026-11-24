@@ -177,6 +177,20 @@ def test_production_composite_strategies_audit_pass():
     assert report4.total_checks == 14
     assert report4.passed_checks == 14
 
+    # Bear Market Dip-Rebound Combo: bear_dip_rebound + vwap_rebound + eod_trend (pessimistic mode)
+    strat5 = build_strategy("bear_dip_rebound", "vwap_rebound", "eod_trend", ambiguity_mode="pessimistic")
+    report5 = auditor.audit(strat5)
+    assert report5.passed is True
+    assert report5.total_checks == 14
+    assert report5.passed_checks == 14
+
+    # Bear Market Dip-Rebound Combo: bear_dip_rebound + vwap_rebound + eod_trend (optimistic mode)
+    strat6 = build_strategy("bear_dip_rebound", "vwap_rebound", "eod_trend", ambiguity_mode="optimistic")
+    report6 = auditor.audit(strat6)
+    assert report6.passed is True
+    assert report6.total_checks == 14
+    assert report6.passed_checks == 14
+
 
 # ============================================================================
 # 3. Defect Detection Power Tests (Auditor Must Catch Invariant Breaches)
