@@ -5,30 +5,36 @@ Provides dynamic instantiation and configuration-based assembly of strategies.
 from __future__ import annotations
 
 from typing import Dict, Type, Any, Optional
+from datetime import time
 from strategy.base import IScanner, IEntryRule, IExitPolicy
 from strategy.composite import CompositeStrategy
 from strategy.scanners.morning_leader_scanner import MorningLeaderScanner
 from strategy.scanners.open_window_scanner import OpenWindowScanner
 from strategy.scanners.bear_dip_rebound_scanner import BearDipReboundScanner
+from strategy.scanners.all_weather_scanner import AllWeatherScanner
 from strategy.entries.morning_breakout_entry import MorningBreakoutEntry
 from strategy.entries.open_window_entry import OpenWindowEntry
 from strategy.entries.vwap_rebound_entry import VwapReboundEntry
+from strategy.entries.all_weather_entry import AllWeatherEntry
 from strategy.exits.morning_leader_exit import MorningLeaderExit
 from strategy.exits.dynamic_leader_exit import DynamicLeaderExit
 from strategy.exits.trailing_lock_exit import TrailingLockExit
 from strategy.exits.eod_trend_exit import EodTrendExit
+from strategy.exits.all_weather_exit import AllWeatherExit
 
 
 SCANNERS: Dict[str, Type[IScanner]] = {
     "morning_leader": MorningLeaderScanner,
     "open_window": OpenWindowScanner,
     "bear_dip_rebound": BearDipReboundScanner,
+    "all_weather": AllWeatherScanner,
 }
 
 ENTRIES: Dict[str, Type[IEntryRule]] = {
     "morning_breakout": MorningBreakoutEntry,
     "open_window": OpenWindowEntry,
     "vwap_rebound": VwapReboundEntry,
+    "all_weather": AllWeatherEntry,
 }
 
 EXITS: Dict[str, Type[IExitPolicy]] = {
@@ -36,6 +42,7 @@ EXITS: Dict[str, Type[IExitPolicy]] = {
     "dynamic_leader": DynamicLeaderExit,
     "trailing_lock": TrailingLockExit,
     "eod_trend": EodTrendExit,
+    "all_weather": AllWeatherExit,
 }
 
 
@@ -91,6 +98,11 @@ def build_strategy(
         base_slots = 1
         expanded_slots = 1
 
+    # All-Weather Integrated Strategy Configuration
+    if scanner_name == "all_weather" or entry_name == "all_weather" or exit_name == "all_weather":
+        if regime_mode == "all" or regime_mode is None:
+            regime_mode = "all_weather"
+
     s_kwargs = (scanner_kwargs or {}).copy()
     if scanner_name == "bear_dip_rebound":
         # Neutralize CLI defaults designed for morning breakout (0.00 to 0.10)
@@ -98,16 +110,43 @@ def build_strategy(
             s_kwargs["min_gap_pct"] = -0.030
         if s_kwargs.get("max_gap_pct") == 0.10:
             s_kwargs["max_gap_pct"] = 0.010
+    if scanner_name == "all_weather":
+        bull_s_kwargs = s_kwargs.copy()
+        bear_s_kwargs = s_kwargs.copy()
+        bull_s_kwargs.setdefault("min_gap_pct", 0.00)
+        bull_s_kwargs.setdefault("max_gap_pct", 0.10)
+        if "use_dynamic_turnover" not in bull_s_kwargs:
+            bull_s_kwargs["use_dynamic_turnover"] = turnover_flag
+        bear_s_kwargs["min_gap_pct"] = -0.030
+        bear_s_kwargs["max_gap_pct"] = 0.010
+        bear_s_kwargs["start_time"] = time(9, 10)
+        bear_s_kwargs["end_time"] = time(9, 10)
+        s_kwargs["bull_kwargs"] = bull_s_kwargs
+        s_kwargs["bear_kwargs"] = bear_s_kwargs
     if "use_dynamic_turnover" not in s_kwargs and scanner_name == "morning_leader":
         s_kwargs["use_dynamic_turnover"] = turnover_flag
 
     e_kwargs = (entry_kwargs or {}).copy()
+    if entry_name == "all_weather":
+        bull_e_kwargs = e_kwargs.copy()
+        bear_e_kwargs = e_kwargs.copy()
+        if "use_dynamic_breakout" not in bull_e_kwargs:
+            bull_e_kwargs["use_dynamic_breakout"] = breakout_flag
+        e_kwargs["bull_kwargs"] = bull_e_kwargs
+        e_kwargs["bear_kwargs"] = bear_e_kwargs
     if "use_dynamic_breakout" not in e_kwargs and entry_name == "morning_breakout":
         e_kwargs["use_dynamic_breakout"] = breakout_flag
 
     x_kwargs = (exit_kwargs or {}).copy()
     if "ambiguity_mode" not in x_kwargs:
         x_kwargs["ambiguity_mode"] = ambiguity_mode
+    if exit_name == "all_weather":
+        bull_x_kwargs = x_kwargs.copy()
+        bear_x_kwargs = x_kwargs.copy()
+        if "use_dynamic_targets" not in bull_x_kwargs:
+            bull_x_kwargs["use_dynamic_targets"] = exit_flag
+        x_kwargs["bull_kwargs"] = bull_x_kwargs
+        x_kwargs["bear_kwargs"] = bear_x_kwargs
     if "use_dynamic_targets" not in x_kwargs and exit_name == "morning_leader":
         x_kwargs["use_dynamic_targets"] = exit_flag
 

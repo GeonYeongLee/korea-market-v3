@@ -191,6 +191,20 @@ def test_production_composite_strategies_audit_pass():
     assert report6.total_checks == 14
     assert report6.passed_checks == 14
 
+    # All-Weather Integrated Strategy: all_weather + all_weather + all_weather (pessimistic mode)
+    strat7 = build_strategy("all_weather", "all_weather", "all_weather", ambiguity_mode="pessimistic")
+    report7 = auditor.audit(strat7)
+    assert report7.passed is True
+    assert report7.total_checks == 14
+    assert report7.passed_checks == 14
+
+    # All-Weather Integrated Strategy: all_weather + all_weather + all_weather (optimistic mode)
+    strat8 = build_strategy("all_weather", "all_weather", "all_weather", ambiguity_mode="optimistic")
+    report8 = auditor.audit(strat8)
+    assert report8.passed is True
+    assert report8.total_checks == 14
+    assert report8.passed_checks == 14
+
 
 # ============================================================================
 # 3. Defect Detection Power Tests (Auditor Must Catch Invariant Breaches)

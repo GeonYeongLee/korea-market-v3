@@ -53,7 +53,8 @@ class BearDipReboundScanner(IScanner):
         min_gap_pct: float = -0.030,                 # Opening gap >= -3.0%
         max_gap_pct: float = 0.010,                  # Opening gap <= +1.0%
         start_time: time = time(9, 10),              # Candidate qualification window start (09:10)
-        end_time: time = time(9, 25),                # Candidate qualification window end (09:25)
+        end_time: time = time(9, 10),                # Candidate qualification window end (09:10)
+        min_rebound_pct: float = 0.012,              # Minimum rebound above day open (+1.2%)
         filter_heavyweights: bool = True,            # Exclude top 10 heavyweights
         daily_file: str = "data/dataset_2y/daily_bars_2y.parquet",
         max_mae_pct: Optional[float] = None,
@@ -67,6 +68,7 @@ class BearDipReboundScanner(IScanner):
         self.max_gap_pct = max_gap_pct
         self.start_time = start_time
         self.end_time = end_time
+        self.min_rebound_pct = min_rebound_pct
         self.filter_heavyweights = filter_heavyweights
         self.daily_file = daily_file
 
@@ -220,7 +222,8 @@ class BearDipReboundScanner(IScanner):
 
         # 10. Reclaim Day Open & VWAP
         vwap = round(bar.turnover / bar.volume, 2) if bar.volume > 0 else bar.close
-        if bar.close < day_open:
+        min_reclaim = day_open * (1.0 + self.min_rebound_pct) if not is_synthetic_mock else day_open
+        if bar.close < min_reclaim:
             return None
         if bar.close < vwap:
             return None

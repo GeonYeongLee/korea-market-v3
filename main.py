@@ -337,14 +337,14 @@ def main() -> None:
 
     # backtest
     bt_parser = subparsers.add_parser("backtest", help="Run deterministic pure 1-minute bar backtest")
-    bt_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    bt_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    bt_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    bt_parser.add_argument("--scanner", default="all_weather", help="Scanner module name")
+    bt_parser.add_argument("--entry", default="all_weather", help="Entry module name")
+    bt_parser.add_argument("--exit", default="all_weather", help="Exit module name")
     bt_parser.add_argument("--start", default="2026-01-02", help="Start date (YYYY-MM-DD or YYYYMMDD, default: 2026-01-02)")
     bt_parser.add_argument("--end", default="2026-11-02", help="End date (YYYY-MM-DD or YYYYMMDD, default: 2026-11-02)")
     bt_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW (default: 10,000,000)")
     bt_parser.add_argument("--mode", choices=["pessimistic", "optimistic", "dual"], default="pessimistic", help="Ambiguity mode (default: pessimistic)")
-    bt_parser.add_argument("--regime-mode", choices=["all", "bear_only"], default="all", help="Regime gating mode: 'all' or 'bear_only' (default: all)")
+    bt_parser.add_argument("--regime-mode", choices=["all", "bear_only", "all_weather"], default="all", help="Regime gating mode: 'all', 'bear_only', or 'all_weather' (default: all)")
     bt_parser.add_argument("--slots", type=int, default=None, help="Fixed daily slots (overrides dynamic slots)")
     bt_parser.add_argument("--data-dir", default=None, help="Custom path to daily 1-min parquet data directory")
     bt_parser.add_argument("--min-gap", type=float, default=0.00, help="Min morning gap (default: 0.00 = 0.0%%)")
@@ -383,18 +383,18 @@ def main() -> None:
 
     # mock
     mock_parser = subparsers.add_parser("mock", help="Run live mock paper trading on KIS VTS")
-    mock_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    mock_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    mock_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    mock_parser.add_argument("--scanner", default="all_weather", help="Scanner module name")
+    mock_parser.add_argument("--entry", default="all_weather", help="Entry module name")
+    mock_parser.add_argument("--exit", default="all_weather", help="Exit module name")
     mock_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW")
     mock_parser.add_argument("--nowait", action="store_true", help="Skip waiting for 09:00 market open")
 
     # live
     live_parser = subparsers.add_parser("live", help="Run live cash trading on KIS REAL (requires --yes)")
     live_parser.add_argument("--yes", action="store_true", help="Confirm real cash execution safety gate")
-    live_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    live_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    live_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    live_parser.add_argument("--scanner", default="all_weather", help="Scanner module name")
+    live_parser.add_argument("--entry", default="all_weather", help="Entry module name")
+    live_parser.add_argument("--exit", default="all_weather", help="Exit module name")
     live_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW")
     live_parser.add_argument("--nowait", action="store_true", help="Skip waiting for 09:00 market open")
 
@@ -403,9 +403,9 @@ def main() -> None:
     routine_parser.add_argument("--mode", choices=["mock", "live"], default="mock", help="Trading mode (mock/live)")
     routine_parser.add_argument("--yes", action="store_true", help="Confirm real money execution for live mode")
     routine_parser.add_argument("--date", default=None, help="Target date YYYYMMDD")
-    routine_parser.add_argument("--scanner", default="morning_leader", help="Scanner module name")
-    routine_parser.add_argument("--entry", default="morning_breakout", help="Entry module name")
-    routine_parser.add_argument("--exit", default="morning_leader", help="Exit module name")
+    routine_parser.add_argument("--scanner", default="all_weather", help="Scanner module name")
+    routine_parser.add_argument("--entry", default="all_weather", help="Entry module name")
+    routine_parser.add_argument("--exit", default="all_weather", help="Exit module name")
     routine_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW")
     routine_parser.add_argument("--nowait", action="store_true", help="Skip waiting for 09:00 market open")
 

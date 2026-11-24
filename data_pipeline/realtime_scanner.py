@@ -156,6 +156,12 @@ class RealtimeLeaderScanner:
         self.scan_end_time = scan_end_time if scan_end_time is not None else strat_end
         self.poll_interval_sec = poll_interval_sec
 
+        if strategy:
+            is_bear = getattr(getattr(strategy, "scanner", None), "is_bear_market", False)
+            if is_bear:
+                self.min_gain_pct = min_gain_pct if min_gain_pct is not None else 0.8
+                self.max_mae_pct = max_mae_pct if max_mae_pct is not None else -8.0
+
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._discovered_symbols: Set[str] = set()

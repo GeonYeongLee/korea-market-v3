@@ -202,9 +202,9 @@ def test_cli_mock_invocation():
             main()
             mock_orch_cls.assert_called_once_with(
                 mode="mock",
-                scanner_name="morning_leader",
-                entry_name="morning_breakout",
-                exit_name="morning_leader",
+                scanner_name="all_weather",
+                entry_name="all_weather",
+                exit_name="all_weather",
                 capital=10_000_000.0,
             )
             mock_orch.run.assert_called_once_with(wait_for_market_open=False)

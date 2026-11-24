@@ -27,8 +27,7 @@ class CompositeStrategy(BaseStrategy):
         gap_filter_index: str = "max", dynamic_max_gap: bool = True,
         bear_market_defense: bool = True, regime_provider: Optional[MarketRegimeProvider] = None,
         dynamic_feature_provider: Optional[DynamicFeatureProvider] = None,
-        regime_mode: Optional[str] = None,
-        name: str = "composite_strategy",
+        regime_mode: Optional[str] = None, name: str = "composite_strategy",
     ):
         self.scanner, self.entry, self.exit_policy = scanner, entry, exit_policy
         self.base_max_daily_positions = self.max_daily_positions = max_daily_positions
@@ -39,8 +38,7 @@ class CompositeStrategy(BaseStrategy):
         self.gap_filter_index = gap_filter_index.lower()
         self.dynamic_max_gap, self.bear_market_defense = dynamic_max_gap, bear_market_defense
         self.regime_provider, self.dynamic_feature_provider = regime_provider, dynamic_feature_provider
-        self.regime_mode = regime_mode
-        self.name = name
+        self.regime_mode, self.name = regime_mode, name
 
         self.current_slot_notional: float = (total_capital / max(1, max_daily_positions)) if max_daily_positions > 0 else 0.0
         self._active_candidates: Set[str] = set()
@@ -95,10 +93,12 @@ class CompositeStrategy(BaseStrategy):
 
         # 0. Custom Regime Mode Gating
         if self.regime_mode == "bear_only":
-            if not idx_feat.is_bear_market:
-                return self._set_regime(0, "Non-Bear Market Inactive (Bear Strategy Dormant)")
-            else:
-                return self._set_regime(self.base_max_daily_positions, "Bear Market Active (1 Slot)")
+            slots = self.base_max_daily_positions if idx_feat.is_bear_market else 0
+            desc = "Bear Market Active (1 Slot)" if idx_feat.is_bear_market else "Non-Bear Market Inactive (Bear Strategy Dormant)"
+            return self._set_regime(slots, desc)
+
+        if self.regime_mode == "all_weather" and idx_feat.is_bear_market:
+            return self._set_regime(1, "All-Weather: Bear Market Active (1 Slot)")
 
         # 1. Bear Market Defense: If both KOSPI and KOSDAQ are below MA20 on t-1 -> 0 slots
         if self.bear_market_defense and idx_feat.is_bear_market:

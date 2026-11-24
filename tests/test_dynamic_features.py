@@ -321,7 +321,6 @@ def test_rest_client_live_market_regime_calculation():
 def test_daily_routine_regime_lifecycle_sync():
     """Verify DailyRoutineOrchestrator syncs live regime at 09:00:01 and executes on_day_open."""
     from engine.daily_routine import DailyRoutineOrchestrator
-    orch = DailyRoutineOrchestrator(mode="mock", target_date="20261116")
 
     mock_regime = {
         "ks_gap_pct": -0.85,
@@ -333,7 +332,16 @@ def test_daily_routine_regime_lifecycle_sync():
         "gap_std": 0.65,
         "slots": 0,
     }
-    with patch("engine.daily_routine.KisLiveBroker") as mock_broker_cls, \
+
+    fake_now = datetime(2026, 11, 16, 9, 30, 0)
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fake_now
+
+    with patch("engine.daily_routine.datetime", FakeDatetime), \
+         patch("engine.daily_routine.KisLiveBroker") as mock_broker_cls, \
          patch("engine.daily_routine.TradingEngine") as mock_engine_cls:
         mock_broker = MagicMock()
         mock_broker.client.get_kospi_gap_and_market_regime.return_value = mock_regime
@@ -345,8 +353,21 @@ def test_daily_routine_regime_lifecycle_sync():
         mock_engine.context.get_balance.return_value = MagicMock(cash=10_000_000.0)
         mock_engine_cls.return_value = mock_engine
 
-        orch.run(wait_for_market_open=False)
-        assert orch.strategy.max_daily_positions == 0
+        # All-Weather (Default): 1 slot allocated in bear market
+        orch_all_weather = DailyRoutineOrchestrator(mode="mock", target_date="20261116")
+        orch_all_weather.run(wait_for_market_open=False)
+        assert orch_all_weather.strategy.max_daily_positions == 1
+
+        # Morning Leader: 0 slots allocated in bear market (defense active)
+        orch_morning_leader = DailyRoutineOrchestrator(
+            mode="mock",
+            target_date="20261116",
+            scanner_name="morning_leader",
+            entry_name="morning_breakout",
+            exit_name="morning_leader",
+        )
+        orch_morning_leader.run(wait_for_market_open=False)
+        assert orch_morning_leader.strategy.max_daily_positions == 0
 
 
 def test_rest_client_fail_safe_conservative_defense():

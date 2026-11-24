@@ -28,9 +28,14 @@ class EodTrendExit(IExitPolicy):
 
     def __init__(
         self,
-        emergency_sl_pct: float = -0.025,       # -2.5% catastrophic stop loss
-        ratchet_mfe_trigger: float = 0.050,     # +5.0% MFE triggers profit lock
-        ratchet_locked_sl_pct: float = 0.020,   # +2.0% profit lock ratchet
+        emergency_sl_pct: float = -0.022,       # -2.2% catastrophic stop loss
+        ratchet_mfe_trigger: float = 0.025,     # +2.5% MFE triggers Stage 1 breakeven/fee lock
+        ratchet_locked_sl_pct: float = 0.005,   # +0.5% profit lock ratchet (covers commission/slippage)
+        ratchet_step2_trigger: float = 0.045,   # +4.5% MFE triggers Stage 2 profit lock
+        ratchet_step2_locked_sl_pct: float = 0.030, # +3.0% profit lock ratchet
+        trailing_trigger_pct: float = 0.050,    # +5.0% MFE triggers continuous trailing stop
+        trailing_offset_pct: float = 0.020,     # 2.0% trailing offset from peak High-Water-Mark
+        enable_trailing: bool = True,           # Trailing SL from HWM after Stage 3
         hard_timeout: time = time(15, 19),      # 15:19:00 EOD hard cutoff (before 15:20 auction)
         ambiguity_mode: str = "pessimistic",    # "pessimistic" or "optimistic"
         **kwargs: Any,
@@ -38,6 +43,11 @@ class EodTrendExit(IExitPolicy):
         self.emergency_sl_pct = emergency_sl_pct
         self.ratchet_mfe_trigger = ratchet_mfe_trigger
         self.ratchet_locked_sl_pct = ratchet_locked_sl_pct
+        self.ratchet_step2_trigger = ratchet_step2_trigger
+        self.ratchet_step2_locked_sl_pct = ratchet_step2_locked_sl_pct
+        self.trailing_trigger_pct = trailing_trigger_pct
+        self.trailing_offset_pct = trailing_offset_pct
+        self.enable_trailing = enable_trailing
         self.hard_timeout = hard_timeout
         self.ambiguity_mode = ambiguity_mode
 
@@ -82,11 +92,26 @@ class EodTrendExit(IExitPolicy):
             position.high_water_mark = current_high
 
         mfe = (position.high_water_mark - position.avg_price) / position.avg_price if position.avg_price > 0 else 0.0
+
+        # Stage 1 Ratchet: +2.5% MFE -> lock +0.5% (covers transaction friction)
         if mfe >= self.ratchet_mfe_trigger:
             raw_locked_sl = position.avg_price * (1.0 + self.ratchet_locked_sl_pct)
             locked_sl = round_to_krx_tick(raw_locked_sl, side="SELL", round_mode="ceil")
-            # Ratchet SL can ONLY increase, never regress
             position.stop_loss_price = max(position.stop_loss_price, locked_sl)
+            position.metadata["sl_ratcheted"] = True
+
+        # Stage 2 Ratchet: +4.5% MFE -> lock +3.0%
+        if mfe >= self.ratchet_step2_trigger:
+            raw_step2 = position.avg_price * (1.0 + self.ratchet_step2_locked_sl_pct)
+            step2_sl = round_to_krx_tick(raw_step2, side="SELL", round_mode="ceil")
+            position.stop_loss_price = max(position.stop_loss_price, step2_sl)
+            position.metadata["sl_ratcheted"] = True
+
+        # Stage 3: Continuous Trailing Stop after +5.0% MFE
+        if self.enable_trailing and mfe >= self.trailing_trigger_pct:
+            raw_trail = position.high_water_mark * (1.0 - self.trailing_offset_pct)
+            trail_sl = round_to_krx_tick(raw_trail, side="SELL", round_mode="ceil")
+            position.stop_loss_price = max(position.stop_loss_price, trail_sl)
             position.metadata["sl_ratcheted"] = True
 
         # 2. Stop-Loss check (Pessimistic ambiguity defense)
