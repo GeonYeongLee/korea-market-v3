@@ -63,6 +63,7 @@ def build_strategy(
     dynamic_exit_targets: Optional[bool] = None,
     dynamic_max_gap: Optional[bool] = None,
     bear_market_defense: Optional[bool] = None,
+    regime_mode: Optional[str] = "all",
 ) -> CompositeStrategy:
     """Builds and returns an assembled CompositeStrategy instance from registry keys."""
     if scanner_name not in SCANNERS:
@@ -130,5 +131,6 @@ def build_strategy(
         gap_filter_index=gap_filter_index,
         dynamic_max_gap=gap_flag,
         bear_market_defense=bear_flag,
+        regime_mode=regime_mode,
         name=f"Composite_{scanner_name}_{entry_name}_{exit_name}",
     )

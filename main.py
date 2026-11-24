@@ -109,6 +109,7 @@ def run_single_backtest(
         dynamic_slots=dynamic_slots,
         ambiguity_mode=ambiguity_mode,
         dynamic=getattr(args, "dynamic", True),
+        regime_mode=getattr(args, "regime_mode", "all"),
     )
     broker = BacktestBroker(initial_capital=args.capital)
     clock = SimulatedClock()
@@ -160,8 +161,9 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         f"[bold cyan]Korea Market v3 Backtest Engine[/bold cyan]\n"
         f"• Exec Mode : [yellow]{args.mode.upper()}[/yellow] | Scanner: [yellow]{args.scanner}[/yellow]\n"
         f"• Entry     : [yellow]{args.entry}[/yellow] | Exit: [yellow]{args.exit}[/yellow]\n"
-        f"• Sizing    : [green]{slots_info}[/green] | Capital: [white]{args.capital:,.0f} KRW[/white]\n"
+        f"• Regime    : [magenta]{getattr(args, 'regime_mode', 'all')}[/magenta] | Sizing: [green]{slots_info}[/green]\n"
         f"• Range     : [white]{args.start or 'Full'} ~ {args.end or 'Latest'}[/white]\n"
+        f"• Capital   : [white]{args.capital:,.0f} KRW[/white]\n"
         f"• Data Dir  : [dim]{data_dir}[/dim]",
         title="[bold green]🚀 Initializing Pure Minute-Bar Simulation[/bold green]",
         expand=False,
@@ -342,6 +344,7 @@ def main() -> None:
     bt_parser.add_argument("--end", default="2026-11-02", help="End date (YYYY-MM-DD or YYYYMMDD, default: 2026-11-02)")
     bt_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW (default: 10,000,000)")
     bt_parser.add_argument("--mode", choices=["pessimistic", "optimistic", "dual"], default="pessimistic", help="Ambiguity mode (default: pessimistic)")
+    bt_parser.add_argument("--regime-mode", choices=["all", "bear_only"], default="all", help="Regime gating mode: 'all' or 'bear_only' (default: all)")
     bt_parser.add_argument("--slots", type=int, default=None, help="Fixed daily slots (overrides dynamic slots)")
     bt_parser.add_argument("--data-dir", default=None, help="Custom path to daily 1-min parquet data directory")
     bt_parser.add_argument("--min-gap", type=float, default=0.00, help="Min morning gap (default: 0.00 = 0.0%%)")
