@@ -94,11 +94,11 @@ class CompositeStrategy(BaseStrategy):
         # 0. Custom Regime Mode Gating
         if self.regime_mode == "bear_only":
             slots = self.base_max_daily_positions if idx_feat.is_bear_market else 0
-            desc = "Bear Market Active (1 Slot)" if idx_feat.is_bear_market else "Non-Bear Market Inactive (Bear Strategy Dormant)"
+            desc = "Bear Market Active" if idx_feat.is_bear_market else "Non-Bear Market Inactive (Bear Strategy Dormant)"
             return self._set_regime(slots, desc)
 
         if self.regime_mode == "all_weather" and idx_feat.is_bear_market:
-            return self._set_regime(1, "All-Weather: Bear Market Active (1 Slot)")
+            return self._set_regime(2, f"All-Weather: Bear Leader Active (KS MA20 {idx_feat.ks_trend:+.2%}, KQ MA20 {idx_feat.kq_trend:+.2%})")
 
         # 1. Bear Market Defense: If both KOSPI and KOSDAQ are below MA20 on t-1 -> 0 slots
         if self.bear_market_defense and idx_feat.is_bear_market:

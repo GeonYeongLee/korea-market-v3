@@ -117,10 +117,14 @@ def build_strategy(
         bull_s_kwargs.setdefault("max_gap_pct", 0.10)
         if "use_dynamic_turnover" not in bull_s_kwargs:
             bull_s_kwargs["use_dynamic_turnover"] = turnover_flag
-        bear_s_kwargs["min_gap_pct"] = -0.030
-        bear_s_kwargs["max_gap_pct"] = 0.010
-        bear_s_kwargs["start_time"] = time(9, 10)
-        bear_s_kwargs["end_time"] = time(9, 10)
+        bear_s_kwargs["min_gap_pct"] = 0.000
+        bear_s_kwargs["max_gap_pct"] = 0.060
+        bear_s_kwargs["max_mae_pct"] = -0.012
+        bear_s_kwargs["min_body_pct"] = 0.035
+        bear_s_kwargs["start_time"] = time(9, 1)
+        bear_s_kwargs["end_time"] = time(9, 25)
+        if "use_dynamic_turnover" not in bear_s_kwargs:
+            bear_s_kwargs["use_dynamic_turnover"] = turnover_flag
         s_kwargs["bull_kwargs"] = bull_s_kwargs
         s_kwargs["bear_kwargs"] = bear_s_kwargs
     if "use_dynamic_turnover" not in s_kwargs and scanner_name == "morning_leader":
@@ -132,6 +136,11 @@ def build_strategy(
         bear_e_kwargs = e_kwargs.copy()
         if "use_dynamic_breakout" not in bull_e_kwargs:
             bull_e_kwargs["use_dynamic_breakout"] = breakout_flag
+        bear_e_kwargs.setdefault("breakout_pct", 0.045)
+        bear_e_kwargs["start_time"] = time(9, 1)
+        bear_e_kwargs["end_time"] = time(9, 25)
+        if "use_dynamic_breakout" not in bear_e_kwargs:
+            bear_e_kwargs["use_dynamic_breakout"] = breakout_flag
         e_kwargs["bull_kwargs"] = bull_e_kwargs
         e_kwargs["bear_kwargs"] = bear_e_kwargs
     if "use_dynamic_breakout" not in e_kwargs and entry_name == "morning_breakout":
@@ -145,6 +154,12 @@ def build_strategy(
         bear_x_kwargs = x_kwargs.copy()
         if "use_dynamic_targets" not in bull_x_kwargs:
             bull_x_kwargs["use_dynamic_targets"] = exit_flag
+        bear_x_kwargs["hard_sl_pct"] = -0.015
+        bear_x_kwargs["tp1_pct"] = 0.025
+        bear_x_kwargs["lock_profit_pct"] = 0.010
+        bear_x_kwargs["trailing_offset_pct"] = 0.015
+        bear_x_kwargs["hard_timeout"] = time(15, 19)
+        bear_x_kwargs["ambiguity_mode"] = ambiguity_mode
         x_kwargs["bull_kwargs"] = bull_x_kwargs
         x_kwargs["bear_kwargs"] = bear_x_kwargs
     if "use_dynamic_targets" not in x_kwargs and exit_name == "morning_leader":

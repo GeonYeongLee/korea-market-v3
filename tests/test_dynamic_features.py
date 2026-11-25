@@ -353,10 +353,10 @@ def test_daily_routine_regime_lifecycle_sync():
         mock_engine.context.get_balance.return_value = MagicMock(cash=10_000_000.0)
         mock_engine_cls.return_value = mock_engine
 
-        # All-Weather (Default): 1 slot allocated in bear market
+        # All-Weather (Default): 2 slots allocated in bear market
         orch_all_weather = DailyRoutineOrchestrator(mode="mock", target_date="20261116")
         orch_all_weather.run(wait_for_market_open=False)
-        assert orch_all_weather.strategy.max_daily_positions == 1
+        assert orch_all_weather.strategy.max_daily_positions == 2
 
         # Morning Leader: 0 slots allocated in bear market (defense active)
         orch_morning_leader = DailyRoutineOrchestrator(

@@ -1,8 +1,8 @@
 """
 All-Weather Integrated Entry Rule.
 Encapsulates:
-  - Bull / Normal Market: MorningBreakoutEntry (+4.5% morning breakout from day open, capped at +0.5%)
-  - Bear Market: VwapReboundEntry (reclaim Day Open & VWAP with +0.5% collar cap)
+  - Bull / Normal Market: MorningBreakoutEntry (09:01~09:03 morning breakout from day open, +0.5% collar cap)
+  - Bear Market: MorningBreakoutEntry (09:01~09:25 decoupled leader breakout, +0.5% collar cap)
 Dynamically delegates based on daily market regime (is_bear_market) determined at on_day_open.
 """
 from __future__ import annotations
@@ -15,23 +15,22 @@ from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_fe
 from engine.models import MinuteBar, TickData, EntrySignal
 from strategy.base import IEntryRule
 from strategy.entries.morning_breakout_entry import MorningBreakoutEntry
-from strategy.entries.vwap_rebound_entry import VwapReboundEntry
 
 logger = logging.getLogger("korea_market.strategy.all_weather_entry")
 
 
 class AllWeatherEntry(IEntryRule):
     """
-    Composite Entry Rule that dynamically delegates to MorningBreakoutEntry
-    or VwapReboundEntry based on index trend regime.
+    Composite Entry Rule that dynamically delegates to regime-tuned MorningBreakoutEntry
+    configurations based on dual-index MA20 trend regime.
     """
 
     name: str = "all_weather_entry"
 
     def __init__(
         self,
-        bull_entry: Optional[MorningBreakoutEntry] = None,
-        bear_entry: Optional[VwapReboundEntry] = None,
+        bull_entry: Optional[IEntryRule] = None,
+        bear_entry: Optional[IEntryRule] = None,
         feature_provider: Optional[DynamicFeatureProvider] = None,
         target_notional: float = 10_000_000.0,
         bull_kwargs: Optional[Dict[str, Any]] = None,
@@ -48,12 +47,16 @@ class AllWeatherEntry(IEntryRule):
             b_kwargs["feature_provider"] = feature_provider
         self.bull_entry = bull_entry or MorningBreakoutEntry(**b_kwargs)
 
-        # Bear entry configuration
+        # Bear entry configuration: 09:01~09:25 breakout window with dynamic ATR/collar control
         br_kwargs = (bear_kwargs or {}).copy()
         br_kwargs.setdefault("target_notional", target_notional)
-        br_kwargs.setdefault("start_time", time(9, 0))
-        br_kwargs.setdefault("end_time", time(9, 10))
-        self.bear_entry = bear_entry or VwapReboundEntry(**br_kwargs)
+        if "feature_provider" not in br_kwargs and feature_provider is not None:
+            br_kwargs["feature_provider"] = feature_provider
+        br_kwargs.setdefault("breakout_pct", 0.045)
+        br_kwargs.setdefault("start_time", time(9, 1))
+        br_kwargs.setdefault("end_time", time(9, 25))
+        br_kwargs.setdefault("use_dynamic_breakout", True)
+        self.bear_entry = bear_entry or MorningBreakoutEntry(**br_kwargs)
 
         self.is_bear_market: bool = True  # Safe default matching mock audit date (2024-10-21)
         self._current_date: Optional[date] = None
@@ -77,11 +80,11 @@ class AllWeatherEntry(IEntryRule):
 
     @property
     def start_time(self) -> time:
-        return getattr(self.active_entry, "start_time", time(9, 0))
+        return getattr(self.active_entry, "start_time", time(9, 1))
 
     @property
     def end_time(self) -> time:
-        return getattr(self.active_entry, "end_time", time(9, 10))
+        return getattr(self.active_entry, "end_time", time(9, 25) if self.is_bear_market else time(9, 3))
 
     @property
     def collar_cap_pct(self) -> float:
@@ -89,9 +92,7 @@ class AllWeatherEntry(IEntryRule):
 
     @property
     def breakout_threshold_pct(self) -> float:
-        if self.is_bear_market:
-            return 1.2
-        return getattr(self.bull_entry, "breakout_threshold_pct", 4.5)
+        return getattr(self.active_entry, "breakout_pct", 0.045) * 100.0
 
     def on_day_open(self, current_date: date) -> None:
         self._current_date = current_date

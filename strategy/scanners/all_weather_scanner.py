@@ -1,8 +1,8 @@
 """
 All-Weather Integrated Scanner.
 Encapsulates:
-  - Bull / Normal Market: MorningLeaderScanner (09:01~09:03 high momentum breakout)
-  - Bear Market: BearDipReboundScanner (09:10 early dip-buying & VWAP reclaim)
+  - Bull / Normal Market: MorningLeaderScanner (09:01~09:03 high momentum breakout, gap 0~10%, MAE -1.5%)
+  - Bear Market: MorningLeaderScanner (09:01~09:25 decoupled leader breakout, gap 0~6%, MAE -1.2%)
 Dynamically delegates based on daily market regime (is_bear_market) determined at on_day_open.
 """
 from __future__ import annotations
@@ -15,23 +15,22 @@ from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_fe
 from engine.models import MinuteBar
 from strategy.base import IScanner
 from strategy.scanners.morning_leader_scanner import MorningLeaderScanner
-from strategy.scanners.bear_dip_rebound_scanner import BearDipReboundScanner
 
 logger = logging.getLogger("korea_market.strategy.all_weather_scanner")
 
 
 class AllWeatherScanner(IScanner):
     """
-    Composite Scanner that dynamically delegates to MorningLeaderScanner
-    or BearDipReboundScanner based on index trend regime.
+    Composite Scanner that dynamically delegates to regime-tuned MorningLeaderScanner
+    configurations based on dual-index MA20 trend regime.
     """
 
     name: str = "all_weather_scanner"
 
     def __init__(
         self,
-        bull_scanner: Optional[MorningLeaderScanner] = None,
-        bear_scanner: Optional[BearDipReboundScanner] = None,
+        bull_scanner: Optional[IScanner] = None,
+        bear_scanner: Optional[IScanner] = None,
         feature_provider: Optional[DynamicFeatureProvider] = None,
         bull_kwargs: Optional[Dict[str, Any]] = None,
         bear_kwargs: Optional[Dict[str, Any]] = None,
@@ -45,13 +44,18 @@ class AllWeatherScanner(IScanner):
             b_kwargs["feature_provider"] = feature_provider
         self.bull_scanner = bull_scanner or MorningLeaderScanner(**b_kwargs)
 
-        # Bear scanner configuration (ensure bear defaults take precedence)
+        # Bear scanner configuration: Decoupled Leader Breakout (09:01~09:25, gap 0~6%, MAE -1.2%)
         br_kwargs = (bear_kwargs or {}).copy()
-        br_kwargs.setdefault("min_gap_pct", -0.030)
-        br_kwargs.setdefault("max_gap_pct", 0.010)
-        br_kwargs.setdefault("start_time", time(9, 10))
-        br_kwargs.setdefault("end_time", time(9, 10))
-        self.bear_scanner = bear_scanner or BearDipReboundScanner(**br_kwargs)
+        if "feature_provider" not in br_kwargs and feature_provider is not None:
+            br_kwargs["feature_provider"] = feature_provider
+        br_kwargs.setdefault("min_gap_pct", 0.000)
+        br_kwargs.setdefault("max_gap_pct", 0.060)
+        br_kwargs.setdefault("max_mae_pct", -0.012)
+        br_kwargs.setdefault("min_body_pct", 0.035)
+        br_kwargs.setdefault("start_time", time(9, 1))
+        br_kwargs.setdefault("end_time", time(9, 25))
+        br_kwargs.setdefault("use_dynamic_turnover", True)
+        self.bear_scanner = bear_scanner or MorningLeaderScanner(**br_kwargs)
 
         self.is_bear_market: bool = True  # Safe default matching mock audit date (2024-10-21)
         self._current_date: Optional[date] = None
@@ -67,7 +71,7 @@ class AllWeatherScanner(IScanner):
 
     @property
     def end_time(self) -> time:
-        return getattr(self.active_scanner, "end_time", time(9, 10))
+        return getattr(self.active_scanner, "end_time", time(9, 25) if self.is_bear_market else time(9, 3))
 
     @property
     def min_cum_turnover(self) -> float:
@@ -75,9 +79,7 @@ class AllWeatherScanner(IScanner):
 
     @property
     def max_mae_pct(self) -> float:
-        if self.is_bear_market:
-            return -0.08  # In bear regime, allow dip down to -8.0%
-        return getattr(self.active_scanner, "max_mae_pct", -0.02)
+        return getattr(self.active_scanner, "max_mae_pct", -0.012 if self.is_bear_market else -0.015)
 
     @property
     def _day_prev_closes(self) -> Dict[str, float]:
@@ -97,6 +99,14 @@ class AllWeatherScanner(IScanner):
         self.is_bear_market = bool(idx_feat.is_bear_market)
 
         self.bull_scanner.on_day_open(current_date)
+        # Share cached daily prev_close lookup to avoid reading daily parquet twice
+        if (
+            hasattr(self.bear_scanner, "_prev_close_lookup")
+            and hasattr(self.bull_scanner, "_prev_close_lookup")
+            and not self.bear_scanner._prev_close_lookup
+            and self.bull_scanner._prev_close_lookup
+        ):
+            self.bear_scanner._prev_close_lookup = self.bull_scanner._prev_close_lookup
         self.bear_scanner.on_day_open(current_date)
 
     def filter_universe(self, current_date: date) -> Optional[List[str]]:

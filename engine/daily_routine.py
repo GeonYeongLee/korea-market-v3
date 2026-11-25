@@ -236,13 +236,19 @@ class DailyRoutineOrchestrator:
             ))
 
         if not should_skip_trading:
+            mae_disp = getattr(getattr(self.strategy, "scanner", None), "max_mae_pct", -0.015) * 100
+            is_bear = getattr(getattr(self.strategy, "scanner", None), "is_bear_market", False)
+            sl_desc = "하드 스탑(-1.5%) & 이익 보존 래칫" if is_bear else "기준봉 중심선/바닥 긴축 즉시 청산"
+            tp_desc = "+2.5% 1차 익절(+1.0% 락) ➔ 1.5% 트레일링" if is_bear else "스마트 스텝업 트레일링 래칫"
+            eod_t = getattr(getattr(self.strategy, "exit_policy", None), "hard_timeout", None)
+            eod_str = eod_t.strftime("%H:%M") if eod_t else "15:20"
             console.print(Panel.fit(
                 f"[bold cyan]⚡ [STAGE 2 & 3] 09:00 ~ {cutoff_str} KIS 조건검색 실시간 돌파 매매 가동[/bold cyan]\n"
-                f"• [bold]진입 조건[/bold]: 당일 시초가 대비 돌파 (누적대금>=10억, MAE>-1.5%%)\n"
+                f"• [bold]진입 조건[/bold]: 당일 시초가 대비 돌파 (동적 누적대금>=10억, MAE>{mae_disp:+.1f}%)\n"
                 f"• [bold]주문 방식[/bold]: 추격 매수 방지 칼라 캡(Collar Cap) 시장성 지정가\n"
-                f"• [bold]손절 관리[/bold]: 기준봉 중심선/바닥 긴축 즉시 청산\n"
-                f"• [bold]익절 관리[/bold]: 스마트 스텝업 트레일링 래칫\n"
-                f"• [bold]세션 종료[/bold]: 당일 매매 완료 즉시 API 완전 차단 ➔ 15:20 장 마감 100% 전량 청산",
+                f"• [bold]손절 관리[/bold]: {sl_desc}\n"
+                f"• [bold]익절 관리[/bold]: {tp_desc}\n"
+                f"• [bold]세션 종료[/bold]: 당일 매매 완료 즉시 API 완전 차단 ➔ {eod_str} 장 마감 100% 전량 청산",
                 border_style="cyan"
             ))
 

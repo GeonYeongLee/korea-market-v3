@@ -2,7 +2,7 @@
 All-Weather Integrated Exit Policy.
 Encapsulates:
   - Bull / Normal Market: MorningLeaderExit (Quad-layer exit: emergency SL, body center SL, step-up TP, 15:21 timeout)
-  - Bear Market: EodTrendExit (Catastrophic SL, Stage 1/2 profit lock ratchet, Stage 3 trailing stop, 15:19 timeout)
+  - Bear Market: TrailingLockExit (-1.5% hard SL, +2.5% TP1 -> +1.0% lock & 1.5% trailing, 15:19 timeout)
 Dynamically delegates based on daily market regime (is_bear_market) determined at on_day_open.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_fe
 from engine.models import MinuteBar, TickData, Position, ExitSignal
 from strategy.base import IExitPolicy
 from strategy.exits.morning_leader_exit import MorningLeaderExit
-from strategy.exits.eod_trend_exit import EodTrendExit
+from strategy.exits.trailing_lock_exit import TrailingLockExit
 
 logger = logging.getLogger("korea_market.strategy.all_weather_exit")
 
@@ -23,15 +23,15 @@ logger = logging.getLogger("korea_market.strategy.all_weather_exit")
 class AllWeatherExit(IExitPolicy):
     """
     Composite Exit Policy that dynamically delegates to MorningLeaderExit
-    or EodTrendExit based on index trend regime.
+    or TrailingLockExit based on dual-index MA20 trend regime.
     """
 
     name: str = "all_weather_exit"
 
     def __init__(
         self,
-        bull_exit: Optional[MorningLeaderExit] = None,
-        bear_exit: Optional[EodTrendExit] = None,
+        bull_exit: Optional[IExitPolicy] = None,
+        bear_exit: Optional[IExitPolicy] = None,
         feature_provider: Optional[DynamicFeatureProvider] = None,
         ambiguity_mode: str = "pessimistic",
         bull_kwargs: Optional[Dict[str, Any]] = None,
@@ -46,10 +46,15 @@ class AllWeatherExit(IExitPolicy):
         b_kwargs.setdefault("ambiguity_mode", ambiguity_mode)
         self.bull_exit = bull_exit or MorningLeaderExit(**b_kwargs)
 
-        # Bear exit configuration
+        # Bear exit configuration: TrailingLockExit (-1.5% SL, +2.5% TP1 -> +1.0% lock, 1.5% trail, 15:19 EOD)
         br_kwargs = (bear_kwargs or {}).copy()
+        br_kwargs.setdefault("hard_sl_pct", -0.015)
+        br_kwargs.setdefault("tp1_pct", 0.025)
+        br_kwargs.setdefault("lock_profit_pct", 0.010)
+        br_kwargs.setdefault("trailing_offset_pct", 0.015)
+        br_kwargs.setdefault("hard_timeout", time(15, 19))
         br_kwargs.setdefault("ambiguity_mode", ambiguity_mode)
-        self.bear_exit = bear_exit or EodTrendExit(**br_kwargs)
+        self.bear_exit = bear_exit or TrailingLockExit(**br_kwargs)
 
         self.is_bear_market: bool = True  # Safe default matching mock audit date (2024-10-21)
         self._current_date: Optional[date] = None
@@ -61,7 +66,11 @@ class AllWeatherExit(IExitPolicy):
 
     @property
     def emergency_sl_pct(self) -> float:
-        return getattr(self.active_exit, "emergency_sl_pct", -0.020)
+        return getattr(self.active_exit, "emergency_sl_pct", getattr(self.active_exit, "hard_sl_pct", -0.015))
+
+    @property
+    def tp_target_pct(self) -> float:
+        return getattr(self.active_exit, "tp_target_pct", getattr(self.active_exit, "tp1_pct", 0.025))
 
     @property
     def hard_timeout(self) -> time:
