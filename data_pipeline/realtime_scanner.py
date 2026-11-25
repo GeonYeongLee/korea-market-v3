@@ -288,8 +288,11 @@ class RealtimeLeaderScanner:
         name_upper = name.upper()
         keywords = [
             "스팩", "SPAC", "리츠", "REIT", "인프라", "펀드",
-            "인버스", "레버리지", "선물", "ETN", "ETF",
-            "KODEX", "TIGER", "ACE", "SOL", "PLUS", "RISE", "KOSEF", "HANARO", "TIMEFOLIO", "히어로즈",
+            "인버스", "레버리지", "선물", "ETN", "ETF", "액티브",
+            "KODEX", "TIGER", "ACE", "SOL", "PLUS", "RISE", "KOSEF", "HANARO",
+            "TIMEFOLIO", "TIME ", "KOACT", "KIWOOM", "MIDAS", "1Q ", "WON ", "BNK ",
+            "ARIRANG", "KBSTAR", "FOCUS", "TREX", "UNICORN", "VITA", "KTOP",
+            "히어로즈", "마이티", "마이다스", "NIFTY", "MSCI", "나스닥", "S&P",
         ]
         if any(kw in name_upper for kw in keywords):
             return False
@@ -505,6 +508,7 @@ class RealtimeLeaderScanner:
                 return newly_promoted
 
             candidate_pool: Dict[str, tuple[float, Dict[str, Any]]] = {}
+            hts_un_enrich_calls = 0
 
             for it in items:
                 code = str(it.get("code", "")).strip()
@@ -526,7 +530,7 @@ class RealtimeLeaderScanner:
                 open_gain = round(((px - day_o) / day_o) * 100.0, 2) if day_o > 0 else 0.0
                 high_gain = round(((day_h - day_o) / day_o) * 100.0, 2) if (day_o > 0 and day_h > 0) else open_gain
                 watch_gain = max(open_gain, high_gain)
-                mae_pct = round(((day_l - day_o) / day_o) * 100.0, 2) if day_o > 0 else 0.0
+                mae_pct = round(((day_l - day_o) / day_o) * 100.0, 2) if (day_o > 0 and day_l > 0) else 0.0
 
                 self._price_cache[code] = {
                     "day_open": day_o,
@@ -581,21 +585,6 @@ class RealtimeLeaderScanner:
                         )
                     continue
 
-                # Condition 2: Cumulative Turnover >= eff_min_to
-                if to_krw < eff_min_to:
-                    logger.info(
-                        f"🔍 [Scanner Watch: Low Turnover] {code} ({name}) | "
-                        f"DayOpen: +{open_gain:.2f}% (>= {eff_min_gain:.2f}%), but "
-                        f"Turnover: {to_krw/1e8:,.1f}억 KRW (< {eff_min_to/1e8:,.1f}억)"
-                    )
-                    telemetry.log_scanner_audit(
-                        symbol=code, name=name, open_gain_pct=open_gain,
-                        turnover_krw=to_krw, day_open=day_o, current_price=px,
-                        day_low=day_l, mae_pct=mae_pct, decision="REJECTED_TURNOVER",
-                        reason=f"Turnover {to_krw/1e8:,.1f}억 < {eff_min_to/1e8:,.1f}억"
-                    )
-                    continue
-
                 # Condition 3: Day Low vs Day Open (MAE >= max_mae_pct, strict < consistent with MorningLeaderScanner)
                 if mae_pct < self.max_mae_pct:
                     self._mae_blacklisted.add(code)
@@ -610,6 +599,37 @@ class RealtimeLeaderScanner:
                         turnover_krw=to_krw, day_open=day_o, current_price=px,
                         day_low=day_l, mae_pct=mae_pct, decision="REJECTED_MAE_BREACH",
                         reason=f"Day Low {mae_pct:.2f}% <= {self.max_mae_pct}%"
+                    )
+                    continue
+
+                # Condition 2: Cumulative Turnover >= eff_min_to (enrich KRX-only HTS with UN KRX+NXT turnover)
+                if to_krw < eff_min_to and it.get("_source") != "VOLUME_RANK_UN" and hasattr(self.client, "get_current_price"):
+                    now_ts_un = time.time()
+                    last_un_ts = self._vr_price_cache_ts.get(code, 0.0)
+                    if (now_ts_un - last_un_ts) >= 12.0 and hts_un_enrich_calls < 10:
+                        try:
+                            cp_un = self.client.get_current_price(code, market_div="UN")
+                            hts_un_enrich_calls += 1
+                            self._vr_price_cache_ts[code] = now_ts_un
+                            if isinstance(cp_un, dict) and cp_un:
+                                un_to = float(cp_un.get("acml_tr_pbmn") or 0.0)
+                                if un_to > to_krw:
+                                    to_krw = un_to
+                                    self._price_cache[code]["turnover_krw"] = to_krw
+                        except Exception as un_err:
+                            logger.debug(f"HTS UN turnover enrichment failed for {code}: {un_err}")
+
+                if to_krw < eff_min_to:
+                    logger.info(
+                        f"🔍 [Scanner Watch: Low Turnover] {code} ({name}) | "
+                        f"DayOpen: +{open_gain:.2f}% (>= {eff_min_gain:.2f}%), but "
+                        f"Turnover: {to_krw/1e8:,.1f}억 KRW (< {eff_min_to/1e8:,.1f}억)"
+                    )
+                    telemetry.log_scanner_audit(
+                        symbol=code, name=name, open_gain_pct=open_gain,
+                        turnover_krw=to_krw, day_open=day_o, current_price=px,
+                        day_low=day_l, mae_pct=mae_pct, decision="REJECTED_TURNOVER",
+                        reason=f"Turnover {to_krw/1e8:,.1f}억 < {eff_min_to/1e8:,.1f}억"
                     )
                     continue
 

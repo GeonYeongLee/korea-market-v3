@@ -100,7 +100,20 @@ def register_symbol_minute_bars(
             latest_to = max([b.cum_turnover for b in bars] + [cum_turnover])
             mae = ((eff_low - first_open) / first_open) if first_open > 0.0 else 0.0
             mae_ok = (max_mae is None) or (math.isfinite(mae) and mae >= max_mae)
-            forming_base = bars[-1].close if (bars and bars[-1].close > 0.0) else first_open
+            now_min = datetime.now().replace(second=0, microsecond=0)
+            same_min_bar = bool(bars and bars[-1].dt.replace(second=0, microsecond=0) == now_min)
+            if same_min_bar and hasattr(strategy, "_forming_bars"):
+                b_cur = bars[-1]
+                strategy._forming_bars[symbol] = MinuteBar(
+                    symbol=symbol, dt=now_min, open=b_cur.open, high=max(b_cur.high, current_price),
+                    low=min(b_cur.low, current_price) if current_price > 0 else b_cur.low,
+                    close=current_price if current_price > 0 else b_cur.close,
+                    volume=b_cur.volume, turnover=b_cur.turnover, cum_turnover=max(b_cur.cum_turnover, cum_turnover),
+                )
+            forming_base = (
+                bars[-1].open if (same_min_bar and bars[-1].open > 0.0)
+                else (bars[-1].close if (bars and bars[-1].close > 0.0) else first_open)
+            )
             in_win = (start_t <= bars[-1].time <= end_t) if bars else (start_t <= datetime.now().time() <= end_t)
             snap_ok = in_win and (forming_base > 0.0 and snap_px > 0.0 and ((snap_px - forming_base) / forming_base >= min_body) and latest_to >= eff_to)
 

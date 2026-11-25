@@ -485,6 +485,25 @@ class KisLiveBroker(IBroker):
 
             if is_success:
                 self.sync_account_state()
+            elif symbol and hasattr(self.client, "inquire_daily_ccld"):
+                try:
+                    ccld_records = self.client.inquire_daily_ccld(symbol=symbol, ccld_dvsn="00") or []
+                    for rec in ccld_records:
+                        odno = str(rec.get("odno") or rec.get("ODNO") or "").strip()
+                        if odno == str(order_id):
+                            filled_qty = int(rec.get("tot_ccld_qty") or rec.get("ccld_qty") or rec.get("CCLD_QTY") or 0)
+                            filled_p = float(rec.get("avg_prvs") or rec.get("ccld_unpr") or rec.get("CCLD_UNPR") or 0.0)
+                            if filled_qty > 0 and filled_p > 0.0:
+                                self._apply_position_fill(symbol, filled_qty, filled_p, side)
+                                self.sync_account_state()
+                                self._emit_event(OrderEvent(
+                                    order_id=order_id, symbol=symbol, side=side, status=OrderStatus.FILLED,
+                                    filled_price=filled_p, filled_quantity=filled_qty, dt=datetime.now(),
+                                    message="FILLED_DETECTED_ON_CANCEL_REJECT",
+                                ))
+                                return False
+                except Exception as ccld_err:
+                    logger.warning(f"Cancel-reject fill check failed for {order_id}: {ccld_err}")
 
             telemetry.record_execution(
                 event_type="ORDER_CANCELLED",

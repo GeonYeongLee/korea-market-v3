@@ -329,5 +329,31 @@ def test_p0_fixes_pending_orders_pre_entry_bar_and_partial_cancel():
     assert scanner2.scan_cycle() == []
     assert vr_client2.get_current_price.call_count == 1
 
+    # 4. HTS KRX-only low turnover (< 8억) enriches via get_current_price(market_div="UN") and promotes if KRX+NXT >= 8억
+    hts_client = MagicMock()
+    hts_client.get_condition_search_result.return_value = [
+        {"code": "003350", "name": "한국화장품제조", "price": "10400", "open": "10000", "high": "10450", "low": "9950", "trade_amt": "600000", "chgrate": "4.0"}
+    ]
+    hts_client.get_current_price.return_value = {"acml_tr_pbmn": "1100000000"}
+    hts_client.get_today_minute_bars.return_value = []
+    hts_feed = MagicMock()
+    hts_feed.active_symbols = []
+    hts_scanner = RealtimeLeaderScanner(
+        client=hts_client, datafeed=hts_feed, enable_volume_rank_feeder=False,
+        min_gain_pct=3.0, min_turnover_krw=800_000_000.0, max_mae_pct=-1.2,
+    )
+    assert hts_scanner.scan_cycle() == ["003350"]
+    hts_client.get_current_price.assert_called_once_with("003350", market_div="UN")
+
+    # 5. Mid-minute promotion preserves current forming bar's true open in _forming_bars for snap_ok & on_tick
+    strat2 = build_strategy(scanner_name="morning_leader", entry_name="morning_breakout", exit_name="morning_leader", dynamic=False)
+    strat2.on_day_open(ctx, date(2026, 11, 26))
+    strat2.scanner.feed_condition_search_symbol("003350")
+    now_min = datetime.now().replace(second=0, microsecond=0)
+    b_cur = MinuteBar(symbol="003350", dt=now_min, open=10000.0, high=10360.0, low=9980.0, close=10360.0, volume=100000, turnover=1_020_000_000.0, cum_turnover=1_200_000_000.0)
+    strat2.register_symbol_minute_bars("003350", [b_cur], day_open=10000.0, day_low=9980.0, day_high=10360.0, current_price=10360.0, cum_turnover=1_200_000_000.0)
+    assert "003350" in strat2._forming_bars
+    assert strat2._forming_bars["003350"].open == 10000.0
+
 
 

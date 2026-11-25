@@ -265,6 +265,7 @@ class DailyRoutineOrchestrator:
             scanner = RealtimeLeaderScanner(
                 client=broker.client,
                 datafeed=datafeed,
+                enable_volume_rank_feeder=False,
                 strategy=self.strategy,
                 context=engine.context,
             )
