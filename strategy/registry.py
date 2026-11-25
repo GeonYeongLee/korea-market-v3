@@ -98,10 +98,15 @@ def build_strategy(
         base_slots = 1
         expanded_slots = 1
 
-    # All-Weather Integrated Strategy Configuration
+    # All-Weather / Unified Regime-Free Strategy Configuration
+    is_unified_mode = regime_mode == "unified" or scanner_name == "all_weather" or entry_name == "all_weather" or exit_name == "all_weather"
     if scanner_name == "all_weather" or entry_name == "all_weather" or exit_name == "all_weather":
-        if regime_mode == "all" or regime_mode is None:
+        if regime_mode in ("all", None):
             regime_mode = "all_weather"
+    if is_unified_mode:
+        bear_flag = False
+        gap_flag = False
+        severe_flag = None
 
     s_kwargs = (scanner_kwargs or {}).copy()
     if scanner_name == "bear_dip_rebound":
@@ -110,39 +115,34 @@ def build_strategy(
             s_kwargs["min_gap_pct"] = -0.030
         if s_kwargs.get("max_gap_pct") == 0.10:
             s_kwargs["max_gap_pct"] = 0.010
+    if is_unified_mode:
+        # Apply validated Unified Regime-Free presets over CLI baseline defaults
+        s_kwargs.setdefault("min_gap_pct", 0.000)
+        if s_kwargs.get("max_gap_pct") in (None, 0.10):
+            s_kwargs["max_gap_pct"] = 0.060
+        if s_kwargs.get("max_mae_pct") in (None, -0.015):
+            s_kwargs["max_mae_pct"] = -0.012
+        s_kwargs.setdefault("min_body_pct", 0.035)
+        s_kwargs.setdefault("start_time", time(9, 1))
+        s_kwargs.setdefault("end_time", time(9, 15))
     if scanner_name == "all_weather":
-        bull_s_kwargs = s_kwargs.copy()
-        bear_s_kwargs = s_kwargs.copy()
-        bull_s_kwargs.setdefault("min_gap_pct", 0.00)
-        bull_s_kwargs.setdefault("max_gap_pct", 0.10)
-        if "use_dynamic_turnover" not in bull_s_kwargs:
-            bull_s_kwargs["use_dynamic_turnover"] = turnover_flag
-        bear_s_kwargs["min_gap_pct"] = 0.000
-        bear_s_kwargs["max_gap_pct"] = 0.060
-        bear_s_kwargs["max_mae_pct"] = -0.012
-        bear_s_kwargs["min_body_pct"] = 0.035
-        bear_s_kwargs["start_time"] = time(9, 1)
-        bear_s_kwargs["end_time"] = time(9, 25)
-        if "use_dynamic_turnover" not in bear_s_kwargs:
-            bear_s_kwargs["use_dynamic_turnover"] = turnover_flag
-        s_kwargs["bull_kwargs"] = bull_s_kwargs
-        s_kwargs["bear_kwargs"] = bear_s_kwargs
+        unified_s = s_kwargs.copy()
+        if "use_dynamic_turnover" not in unified_s:
+            unified_s["use_dynamic_turnover"] = turnover_flag
+        s_kwargs["bull_kwargs"] = unified_s
     if "use_dynamic_turnover" not in s_kwargs and scanner_name == "morning_leader":
         s_kwargs["use_dynamic_turnover"] = turnover_flag
 
     e_kwargs = (entry_kwargs or {}).copy()
+    if is_unified_mode:
+        e_kwargs.setdefault("breakout_pct", 0.045)
+        e_kwargs.setdefault("start_time", time(9, 1))
+        e_kwargs.setdefault("end_time", time(9, 15))
     if entry_name == "all_weather":
-        bull_e_kwargs = e_kwargs.copy()
-        bear_e_kwargs = e_kwargs.copy()
-        if "use_dynamic_breakout" not in bull_e_kwargs:
-            bull_e_kwargs["use_dynamic_breakout"] = breakout_flag
-        bear_e_kwargs.setdefault("breakout_pct", 0.045)
-        bear_e_kwargs["start_time"] = time(9, 1)
-        bear_e_kwargs["end_time"] = time(9, 25)
-        if "use_dynamic_breakout" not in bear_e_kwargs:
-            bear_e_kwargs["use_dynamic_breakout"] = breakout_flag
-        e_kwargs["bull_kwargs"] = bull_e_kwargs
-        e_kwargs["bear_kwargs"] = bear_e_kwargs
+        unified_e = e_kwargs.copy()
+        if "use_dynamic_breakout" not in unified_e:
+            unified_e["use_dynamic_breakout"] = breakout_flag
+        e_kwargs["bull_kwargs"] = unified_e
     if "use_dynamic_breakout" not in e_kwargs and entry_name == "morning_breakout":
         e_kwargs["use_dynamic_breakout"] = breakout_flag
 
@@ -150,18 +150,12 @@ def build_strategy(
     if "ambiguity_mode" not in x_kwargs:
         x_kwargs["ambiguity_mode"] = ambiguity_mode
     if exit_name == "all_weather":
-        bull_x_kwargs = x_kwargs.copy()
-        bear_x_kwargs = x_kwargs.copy()
-        if "use_dynamic_targets" not in bull_x_kwargs:
-            bull_x_kwargs["use_dynamic_targets"] = exit_flag
-        bear_x_kwargs["hard_sl_pct"] = -0.015
-        bear_x_kwargs["tp1_pct"] = 0.025
-        bear_x_kwargs["lock_profit_pct"] = 0.010
-        bear_x_kwargs["trailing_offset_pct"] = 0.015
-        bear_x_kwargs["hard_timeout"] = time(15, 19)
-        bear_x_kwargs["ambiguity_mode"] = ambiguity_mode
-        x_kwargs["bull_kwargs"] = bull_x_kwargs
-        x_kwargs["bear_kwargs"] = bear_x_kwargs
+        unified_x = x_kwargs.copy()
+        if "use_dynamic_targets" not in unified_x:
+            unified_x["use_dynamic_targets"] = exit_flag
+        x_kwargs["bull_kwargs"] = unified_x
+    if "use_dynamic_targets" not in x_kwargs and exit_name == "morning_leader":
+        x_kwargs["use_dynamic_targets"] = exit_flag
     if "use_dynamic_targets" not in x_kwargs and exit_name == "morning_leader":
         x_kwargs["use_dynamic_targets"] = exit_flag
 

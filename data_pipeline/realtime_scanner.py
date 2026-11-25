@@ -41,6 +41,7 @@ def parse_kis_minute_bars(symbol: str, raw_bars: List[Dict[str, Any]]) -> List[M
     latest_date_str = max(dates) if dates else datetime.now().strftime("%Y%m%d")
 
     parsed: List[MinuteBar] = []
+    temp_rows: List[tuple] = []
     for b in raw_bars:
         b_date = str(b.get("stck_bsop_date") or "")
         if latest_date_str and b_date and b_date != latest_date_str:
@@ -74,18 +75,17 @@ def parse_kis_minute_bars(symbol: str, raw_bars: List[Dict[str, Any]]) -> List[M
                     )
                 except Exception:
                     dt = datetime.now()
-                parsed.append(MinuteBar(
-                    symbol=symbol,
-                    dt=dt,
-                    open=op,
-                    high=hp,
-                    low=lp,
-                    close=cp,
-                    volume=vol,
-                    turnover=to_val,
-                    cum_turnover=cum_to,
-                ))
-    parsed.sort(key=lambda b: b.dt)
+                temp_rows.append((dt, op, hp, lp, cp, vol, to_val, cum_to))
+
+    temp_rows.sort(key=lambda r: r[0])
+    running_to = 0.0
+    for dt, op, hp, lp, cp, vol, to_val, cum_to in temp_rows:
+        running_to += to_val
+        eff_cum_to = cum_to if cum_to > 0.0 else running_to
+        parsed.append(MinuteBar(
+            symbol=symbol, dt=dt, open=op, high=hp, low=lp, close=cp,
+            volume=vol, turnover=to_val, cum_turnover=eff_cum_to,
+        ))
     return parsed
 
 
@@ -220,17 +220,18 @@ class RealtimeLeaderScanner:
             elif hasattr(self.strategy, "feed_condition_search_symbol"):
                 self.strategy.feed_condition_search_symbol(symbol)
 
-        # Day Open & Day Low injection if supported (legacy / fallback)
+        # Day Open / Day Low / Prev Close injection into CompositeStrategy
         day_o = float(item.get("day_open", 0.0) or item.get("open", 0.0) or item.get("stck_oprc", 0.0))
         day_l = float(item.get("day_low", 0.0) or item.get("low", 0.0) or item.get("stck_lwpr", 0.0))
+        prev_c = float(item.get("prev_close", 0.0) or item.get("stck_prdy_clpr", 0.0) or 0.0)
         to_krw = float(
             item.get("turnover_krw", 0.0)
             or (float(item.get("trade_amt", 0.0) or 0.0) * 1000.0)
             or item.get("acml_tr_pbmn", 0.0)
         )
-        if self.strategy and hasattr(self.strategy, "register_symbol_day_open") and day_o > 0:
+        if self.strategy and hasattr(self.strategy, "register_symbol_day_open") and (day_o > 0 or prev_c > 0):
             self.strategy.register_symbol_day_open(
-                symbol, day_o, day_l, cum_turnover=to_krw, is_promoted=True
+                symbol, day_o, day_l, cum_turnover=to_krw, prev_close=prev_c, is_promoted=True
             )
 
         # b) Fetch today's official 1-minute bars using client.get_today_minute_bars(symbol)
@@ -238,12 +239,14 @@ class RealtimeLeaderScanner:
             try:
                 raw_bars = self.client.get_today_minute_bars(symbol)
                 if raw_bars:
-                    if self.strategy and hasattr(self.strategy, "register_symbol_minute_bars"):
-                        self.strategy.register_symbol_minute_bars(symbol, raw_bars, is_promoted=True)
-
                     parsed_bars = parse_kis_minute_bars(symbol, raw_bars)
-                    for bar in parsed_bars:
-                        if self.strategy and hasattr(self.strategy, "scanner") and hasattr(self.strategy.scanner, "on_bar"):
+                    if self.strategy and isinstance(getattr(self.strategy, "_active_candidates", None), set) and hasattr(self.strategy, "register_symbol_minute_bars"):
+                        self.strategy.register_symbol_minute_bars(
+                            symbol, parsed_bars, day_open=day_o, day_low=day_l,
+                            cum_turnover=to_krw, prev_close=prev_c, is_promoted=True,
+                        )
+                    elif self.strategy and hasattr(self.strategy, "scanner") and hasattr(self.strategy.scanner, "on_bar"):
+                        for bar in parsed_bars:
                             self.strategy.scanner.on_bar(bar.date, bar)
                     logger.info(f"📊 [{symbol}] Synced & registered {len(parsed_bars)} 1-minute bars to scanner indicators.")
             except Exception as e:
@@ -435,26 +438,33 @@ class RealtimeLeaderScanner:
                         rank_items = self.client.get_volume_rank(market_div="UN")
                         if rank_items:
                             existing_codes = {str(it.get("code", "")).strip() for it in items}
-                            for r in rank_items[:30]:  # Top 30 UN turnover leaders
+                            un_added = 0
+                            for r in rank_items:  # Filter ETF/ETN/SPAC BEFORE slicing top 30 UN leaders
+                                if un_added >= 30:
+                                    break
                                 r_code = str(r.get("mksc_shrn_iscd") or r.get("stck_shrn_iscd") or "").strip()
-                                if r_code and r_code not in existing_codes and self._is_target_stock(r_code):
-                                    stck_prpr = str(r.get("stck_prpr", "0") or "0")
-                                    if float(stck_prpr or 0.0) > 0:
-                                        tot_to = float(r.get("_tot_to", 0.0) or r.get("acml_tr_pbmn", 0.0) or 0.0)
-                                        norm_item = {
-                                            "code": r_code,
-                                            "name": str(r.get("hts_kor_isnm", "") or ""),
-                                            "price": stck_prpr,
-                                            "open": str(r.get("stck_oprc", "0") or "0"),
-                                            "high": str(r.get("stck_hgpr", "0") or "0"),
-                                            "low": str(r.get("stck_lwpr", "0") or "0"),
-                                            "trade_amt": str(tot_to / 1000.0),
-                                            "acml_vol": str(r.get("acml_vol", "0") or "0"),
-                                            "chgrate": str(r.get("prdy_ctrt", "0") or "0"),
-                                            "_source": "VOLUME_RANK_UN",
-                                        }
-                                        items.append(norm_item)
-                                        existing_codes.add(r_code)
+                                r_name = str(r.get("hts_kor_isnm", "") or "")
+                                if r_code and self._is_target_stock(r_code, r_name):
+                                    un_added += 1
+                                    if r_code not in existing_codes:
+                                        stck_prpr = str(r.get("stck_prpr", "0") or "0")
+                                        if float(stck_prpr or 0.0) > 0:
+                                            tot_to = float(r.get("_tot_to", 0.0) or r.get("acml_tr_pbmn", 0.0) or 0.0)
+                                            norm_item = {
+                                                "code": r_code,
+                                                "name": r_name,
+                                                "price": stck_prpr,
+                                                "open": str(r.get("stck_oprc", "0") or "0"),
+                                                "high": str(r.get("stck_hgpr", "0") or "0"),
+                                                "low": str(r.get("stck_lwpr", "0") or "0"),
+                                                "trade_amt": str(tot_to / 1000.0),
+                                                "acml_vol": str(r.get("acml_vol", "0") or "0"),
+                                                "chgrate": str(r.get("prdy_ctrt", "0") or "0"),
+                                                "prev_close": str(r.get("stck_prdy_clpr", "0") or "0"),
+                                                "_source": "VOLUME_RANK_UN",
+                                            }
+                                            items.append(norm_item)
+                                            existing_codes.add(r_code)
                     except Exception as vr_err:
                         logger.debug(f"Dual volume rank poll failed: {vr_err}")
 
@@ -477,14 +487,20 @@ class RealtimeLeaderScanner:
                 to_krw = float(it.get("trade_amt", 0.0) or 0.0) * 1000.0
                 vol = int(float(it.get("acml_vol", 0.0) or 0.0))
                 chgrate = float(it.get("chgrate", 0.0) or 0.0)
+                prev_close = float(it.get("prev_close", 0.0) or it.get("stck_prdy_clpr", 0.0) or 0.0)
+                if prev_close <= 0.0 and px > 0.0 and (1.0 + chgrate / 100.0) > 0.0 and chgrate != 0.0:
+                    prev_close = px / (1.0 + chgrate / 100.0)
 
                 open_gain = round(((px - day_o) / day_o) * 100.0, 2) if day_o > 0 else 0.0
+                high_gain = round(((day_h - day_o) / day_o) * 100.0, 2) if (day_o > 0 and day_h > 0) else open_gain
+                watch_gain = max(open_gain, high_gain)
                 mae_pct = round(((day_l - day_o) / day_o) * 100.0, 2) if day_o > 0 else 0.0
 
                 self._price_cache[code] = {
                     "day_open": day_o,
                     "day_low": day_l,
                     "day_high": day_h,
+                    "prev_close": prev_close,
                     "current_price": px,
                     "turnover_krw": to_krw,
                 }
@@ -493,29 +509,58 @@ class RealtimeLeaderScanner:
                 if code in self._discovered_symbols:
                     continue
 
-                # Condition 1: Gain check
-                if open_gain < self.min_gain_pct:
-                    if open_gain >= 2.0:
+                # Resolve per-symbol dynamic thresholds & gap bounds when strategy is attached
+                eff_min_to = self.min_turnover_krw
+                eff_min_gain = self.min_gain_pct
+                sc_mod = getattr(self.strategy, "scanner", None) if self.strategy else None
+                sc_target = getattr(sc_mod, "active_scanner", sc_mod) if sc_mod else None
+                en_mod = getattr(self.strategy, "entry", None) if self.strategy else None
+                en_target = getattr(en_mod, "active_entry", en_mod) if en_mod else None
+
+                if sc_target and prev_close > 0.0 and day_o > 0.0:
+                    min_g = getattr(sc_target, "min_gap_pct", None)
+                    max_g = getattr(sc_target, "max_gap_pct", None)
+                    gap = (day_o - prev_close) / prev_close
+                    if (isinstance(min_g, (int, float)) and gap < float(min_g)) or (isinstance(max_g, (int, float)) and gap > float(max_g)):
+                        self._discovered_symbols.add(code)
+                        continue
+
+                feats = getattr(sc_target, "_day_features", None) if sc_target else None
+                if isinstance(feats, dict) and getattr(sc_target, "use_dynamic_turnover", False) is True and code in feats:
+                    adto = getattr(feats[code], "prior_adto20", 0.0)
+                    if isinstance(adto, (int, float)) and adto > 0.0:
+                        eff_min_to = max(500_000_000.0, min(2_500_000_000.0, 0.08 * float(adto))) * 0.8
+
+                en_feats = getattr(en_target, "_day_features", None) if en_target else None
+                if isinstance(en_feats, dict) and getattr(en_target, "use_dynamic_breakout", False) is True and code in en_feats:
+                    atr = getattr(en_feats[code], "prior_atr20_pct", 0.0)
+                    if isinstance(atr, (int, float)) and atr > 0.0:
+                        dyn_bo = max(2.5, min(5.5, 0.40 * float(atr) * 100.0))
+                        eff_min_gain = max(2.0, dyn_bo - 1.0)
+
+                # Condition 1: Gain check (open gain or intra-session high strike)
+                if watch_gain < eff_min_gain:
+                    if watch_gain >= 2.0:
                         telemetry.log_scanner_audit(
                             symbol=code, name=name, open_gain_pct=open_gain,
                             turnover_krw=to_krw, day_open=day_o, current_price=px,
                             day_low=day_l, mae_pct=mae_pct, decision="NEAR_STRIKE_WATCH",
-                            reason=f"Open gain (+{open_gain:.2f}%) < {self.min_gain_pct}%"
+                            reason=f"Gain (+{watch_gain:.2f}%) < {eff_min_gain:.2f}%"
                         )
                     continue
 
-                # Condition 2: Cumulative Turnover >= min_turnover_krw
-                if to_krw < self.min_turnover_krw:
+                # Condition 2: Cumulative Turnover >= eff_min_to
+                if to_krw < eff_min_to:
                     logger.info(
                         f"🔍 [Scanner Watch: Low Turnover] {code} ({name}) | "
-                        f"DayOpen: +{open_gain:.2f}% (>= {self.min_gain_pct}%), but "
-                        f"Turnover: {to_krw/1e8:,.1f}억 KRW (< {self.min_turnover_krw/1e8:,.1f}억)"
+                        f"DayOpen: +{open_gain:.2f}% (>= {eff_min_gain:.2f}%), but "
+                        f"Turnover: {to_krw/1e8:,.1f}억 KRW (< {eff_min_to/1e8:,.1f}억)"
                     )
                     telemetry.log_scanner_audit(
                         symbol=code, name=name, open_gain_pct=open_gain,
                         turnover_krw=to_krw, day_open=day_o, current_price=px,
                         day_low=day_l, mae_pct=mae_pct, decision="REJECTED_TURNOVER",
-                        reason=f"Turnover {to_krw/1e8:,.1f}억 < {self.min_turnover_krw/1e8:,.1f}억"
+                        reason=f"Turnover {to_krw/1e8:,.1f}억 < {eff_min_to/1e8:,.1f}억"
                     )
                     continue
 
@@ -556,6 +601,7 @@ class RealtimeLeaderScanner:
                     "chgrate": chgrate,
                     "stck_oprc": day_o,
                     "stck_lwpr": day_l,
+                    "prev_close": prev_close,
                     "acml_tr_pbmn": to_krw,
                     "acml_vol": vol,
                 })

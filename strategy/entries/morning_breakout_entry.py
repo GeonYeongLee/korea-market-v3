@@ -69,11 +69,11 @@ class MorningBreakoutEntry(IEntryRule):
     def evaluate_entry(
         self,
         symbol: str,
-        bar: MinuteBar,
+        bar: Optional[MinuteBar] = None,
         tick: Optional[TickData] = None,
         context_state: Optional[Dict[str, Any]] = None,
     ) -> Optional[EntrySignal]:
-        if self.target_notional <= 0:
+        if self.target_notional <= 0 or (bar is None and tick is None):
             return None
 
         # Single-fire daily rule
@@ -84,14 +84,17 @@ class MorningBreakoutEntry(IEntryRule):
         if t < self.start_time or t > self.end_time:
             return None
 
-        # Resolve day open: prefer context_state (from scanner), then cached, fallback to bar.open
+        # Resolve day open: prefer context_state (from scanner), then cached, fallback to tick/bar open
         day_open = 0.0
         if context_state and "day_open" in context_state and context_state["day_open"]:
             day_open = context_state["day_open"]
             self._day_open_prices[symbol] = day_open
         elif symbol in self._day_open_prices:
             day_open = self._day_open_prices[symbol]
-        else:
+        elif tick is not None and tick.day_open > 0:
+            day_open = tick.day_open
+            self._day_open_prices[symbol] = day_open
+        elif bar is not None:
             day_open = bar.open
             self._day_open_prices[symbol] = day_open
 
@@ -141,7 +144,7 @@ class MorningBreakoutEntry(IEntryRule):
         }
 
         # Anti-chase Collar Cap Check 1: Opening price gapped over collar cap
-        if bar.open > collar_cap_price:
+        if bar is not None and bar.open > collar_cap_price:
             telemetry.record_strategy_eval("ENTRY", symbol, "REJECT", f"FAIL_COLLAR_CAP_OPEN ({bar.open} > {collar_cap_price})", metrics, dt=eval_dt)
             return None
 

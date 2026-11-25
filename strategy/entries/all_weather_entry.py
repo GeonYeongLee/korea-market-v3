@@ -1,9 +1,7 @@
 """
-All-Weather Integrated Entry Rule.
-Encapsulates:
-  - Bull / Normal Market: MorningBreakoutEntry (09:01~09:03 morning breakout from day open, +0.5% collar cap)
-  - Bear Market: MorningBreakoutEntry (09:01~09:25 decoupled leader breakout, +0.5% collar cap)
-Dynamically delegates based on daily market regime (is_bear_market) determined at on_day_open.
+All-Weather Unified Entry Rule.
+Uses the empirically validated Regime-Free MorningBreakoutEntry across ALL market regimes:
+  - Window: 09:01 ~ 09:15 (0% lookahead, dynamic ATR breakout threshold + +0.5% collar cap)
 """
 from __future__ import annotations
 
@@ -21,8 +19,7 @@ logger = logging.getLogger("korea_market.strategy.all_weather_entry")
 
 class AllWeatherEntry(IEntryRule):
     """
-    Composite Entry Rule that dynamically delegates to regime-tuned MorningBreakoutEntry
-    configurations based on dual-index MA20 trend regime.
+    Unified Entry Rule delegating to a single regime-free MorningBreakoutEntry configuration.
     """
 
     name: str = "all_weather_entry"
@@ -40,25 +37,32 @@ class AllWeatherEntry(IEntryRule):
         self.feature_provider = feature_provider
         self._target_notional = target_notional
 
-        # Bull entry configuration
-        b_kwargs = (bull_kwargs or {}).copy()
-        b_kwargs.setdefault("target_notional", target_notional)
-        if "feature_provider" not in b_kwargs and feature_provider is not None:
-            b_kwargs["feature_provider"] = feature_provider
-        self.bull_entry = bull_entry or MorningBreakoutEntry(**b_kwargs)
+        u_kwargs = (bull_kwargs or {}).copy()
+        u_kwargs.setdefault("target_notional", target_notional)
+        if "feature_provider" not in u_kwargs and feature_provider is not None:
+            u_kwargs["feature_provider"] = feature_provider
+        u_kwargs.setdefault("breakout_pct", 0.045)
+        u_kwargs.setdefault("start_time", time(9, 1))
+        u_kwargs.setdefault("end_time", time(9, 15))
+        u_kwargs.setdefault("use_dynamic_breakout", True)
+        self.bull_entry = bull_entry or MorningBreakoutEntry(**u_kwargs)
 
-        # Bear entry configuration: 09:01~09:25 breakout window with dynamic ATR/collar control
-        br_kwargs = (bear_kwargs or {}).copy()
-        br_kwargs.setdefault("target_notional", target_notional)
-        if "feature_provider" not in br_kwargs and feature_provider is not None:
-            br_kwargs["feature_provider"] = feature_provider
-        br_kwargs.setdefault("breakout_pct", 0.045)
-        br_kwargs.setdefault("start_time", time(9, 1))
-        br_kwargs.setdefault("end_time", time(9, 25))
-        br_kwargs.setdefault("use_dynamic_breakout", True)
-        self.bear_entry = bear_entry or MorningBreakoutEntry(**br_kwargs)
+        if bear_entry is not None:
+            self.bear_entry = bear_entry
+        elif bear_kwargs:
+            br_kwargs = bear_kwargs.copy()
+            br_kwargs.setdefault("target_notional", target_notional)
+            if "feature_provider" not in br_kwargs and feature_provider is not None:
+                br_kwargs["feature_provider"] = feature_provider
+            br_kwargs.setdefault("breakout_pct", 0.045)
+            br_kwargs.setdefault("start_time", time(9, 1))
+            br_kwargs.setdefault("end_time", time(9, 15))
+            br_kwargs.setdefault("use_dynamic_breakout", True)
+            self.bear_entry = MorningBreakoutEntry(**br_kwargs)
+        else:
+            self.bear_entry = self.bull_entry
 
-        self.is_bear_market: bool = True  # Safe default matching mock audit date (2024-10-21)
+        self.is_bear_market: bool = False
         self._current_date: Optional[date] = None
 
     @property
@@ -75,7 +79,7 @@ class AllWeatherEntry(IEntryRule):
         self._target_notional = value
         if hasattr(self.bull_entry, "target_notional"):
             self.bull_entry.target_notional = value
-        if hasattr(self.bear_entry, "target_notional"):
+        if self.bear_entry is not self.bull_entry and hasattr(self.bear_entry, "target_notional"):
             self.bear_entry.target_notional = value
 
     @property
@@ -84,7 +88,7 @@ class AllWeatherEntry(IEntryRule):
 
     @property
     def end_time(self) -> time:
-        return getattr(self.active_entry, "end_time", time(9, 25) if self.is_bear_market else time(9, 3))
+        return getattr(self.active_entry, "end_time", time(9, 15))
 
     @property
     def collar_cap_pct(self) -> float:
@@ -101,12 +105,13 @@ class AllWeatherEntry(IEntryRule):
         self.is_bear_market = bool(idx_feat.is_bear_market)
 
         self.bull_entry.on_day_open(current_date)
-        self.bear_entry.on_day_open(current_date)
+        if self.bear_entry is not self.bull_entry:
+            self.bear_entry.on_day_open(current_date)
 
     def evaluate_entry(
         self,
         symbol: str,
-        bar: MinuteBar,
+        bar: Optional[MinuteBar] = None,
         tick: Optional[TickData] = None,
         context_state: Optional[Dict[str, Any]] = None,
     ) -> Optional[EntrySignal]:
@@ -115,11 +120,11 @@ class AllWeatherEntry(IEntryRule):
     def register_day_open(self, symbol: str, price: float) -> None:
         if hasattr(self.bull_entry, "register_day_open"):
             self.bull_entry.register_day_open(symbol, price)
-        if hasattr(self.bear_entry, "register_day_open"):
+        if self.bear_entry is not self.bull_entry and hasattr(self.bear_entry, "register_day_open"):
             self.bear_entry.register_day_open(symbol, price)
 
     def rollback_entered_symbol(self, symbol: str) -> None:
         if hasattr(self.bull_entry, "rollback_entered_symbol"):
             self.bull_entry.rollback_entered_symbol(symbol)
-        if hasattr(self.bear_entry, "rollback_entered_symbol"):
+        if self.bear_entry is not self.bull_entry and hasattr(self.bear_entry, "rollback_entered_symbol"):
             self.bear_entry.rollback_entered_symbol(symbol)

@@ -238,18 +238,15 @@ class DailyRoutineOrchestrator:
             ))
 
         if not should_skip_trading:
-            mae_disp = getattr(getattr(self.strategy, "scanner", None), "max_mae_pct", -0.015) * 100
-            is_bear = getattr(getattr(self.strategy, "scanner", None), "is_bear_market", False)
-            sl_desc = "하드 스탑(-1.5%) & 이익 보존 래칫" if is_bear else "기준봉 중심선/바닥 긴축 즉시 청산"
-            tp_desc = "+2.5% 1차 익절(+1.0% 락) ➔ 1.5% 트레일링" if is_bear else "스마트 스텝업 트레일링 래칫"
+            mae_disp = getattr(getattr(self.strategy, "scanner", None), "max_mae_pct", -0.012) * 100
             eod_t = getattr(getattr(self.strategy, "exit_policy", None), "hard_timeout", None)
             eod_str = eod_t.strftime("%H:%M") if eod_t else "15:20"
             console.print(Panel.fit(
-                f"[bold cyan]⚡ [STAGE 2 & 3] 09:00 ~ {cutoff_str} KIS 조건검색 실시간 돌파 매매 가동[/bold cyan]\n"
-                f"• [bold]진입 조건[/bold]: 당일 시초가 대비 돌파 (동적 누적대금>=10억, MAE>{mae_disp:+.1f}%)\n"
+                f"[bold cyan]⚡ [STAGE 2 & 3] 09:00 ~ {cutoff_str} KIS 조건검색 + WebSocket 통합 돌파 매매 가동[/bold cyan]\n"
+                f"• [bold]진입 조건[/bold]: 당일 시초가 대비 돌파 (동적 누적대금>=10억, 갭 0~+6%, MAE>{mae_disp:+.1f}%)\n"
                 f"• [bold]주문 방식[/bold]: 추격 매수 방지 칼라 캡(Collar Cap) 시장성 지정가\n"
-                f"• [bold]손절 관리[/bold]: {sl_desc}\n"
-                f"• [bold]익절 관리[/bold]: {tp_desc}\n"
+                f"• [bold]손절 관리[/bold]: 기준봉 중심선/바닥 긴축 즉시 청산\n"
+                f"• [bold]익절 관리[/bold]: 스마트 스텝업 트레일링 래칫\n"
                 f"• [bold]세션 종료[/bold]: 당일 매매 완료 즉시 API 완전 차단 ➔ {eod_str} 장 마감 100% 전량 청산",
                 border_style="cyan"
             ))
@@ -339,19 +336,27 @@ class DailyRoutineOrchestrator:
                                                 tag="EOD_AUCTION_1520",
                                             ))
 
-                    # Check daily trading completion
+                    # Cancel resting stale BUY orders (>45s) so collar bids do not fill on delayed dumps
+                    if hasattr(broker, "cancel_stale_buy_orders"):
+                        broker.cancel_stale_buy_orders(max_age_sec=45.0)
+
+                    # Check daily trading completion (must wait for pending orders before session teardown)
                     is_done = getattr(self.strategy, "is_daily_trading_completed", False)
                     if callable(is_done):
                         is_done = is_done()
                     open_pos = broker.get_positions()
+                    pending_orders = broker.get_pending_orders() if hasattr(broker, "get_pending_orders") else []
 
-                    if is_done and not open_pos:
+                    if is_done and not open_pos and not pending_orders:
                         console.print(
                             f"\n[bold green]🛑 [STAGE 4] 당일 목표 매매 완료 감지: 전량 청산 완료 및 쿼터 소진![/bold green]"
                         )
                         break
 
                     if curr_t > cutoff_t and not open_pos:
+                        if pending_orders:
+                            broker.cancel_pending_orders()
+                            continue
                         console.print(
                             f"\n[bold yellow]🛑 [STAGE 4] 골든 윈도우 마감 ({cutoff_str}) 및 보유 잔고 0: 당일 매매 세션을 종료합니다.[/bold yellow]"
                         )

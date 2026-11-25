@@ -147,36 +147,29 @@ class MorningLeaderExit(IExitPolicy):
                     return self._make_signal(position, current_dt, bar.close, "SMART_STEP_UP_MATURED_EXIT")
             return None
 
-        # 1-Minute Candle Close TP / Super Leader Promotion
-        if position.metadata.get("tp_triggered", False):
-            exit_exec_price = tick.price if tick else (bar.close if bar else position.current_price)
+        # 1-Minute Candle Close TP / Super Leader Promotion (evaluated at bar close for 0% live-backtest gap)
+        if position.metadata.get("tp_triggered", False) and bar is not None:
+            exit_exec_price = bar.close
+            eff_step_up_pct = position.metadata.get("step_up_pct", self.step_up_pct)
+            step2_price = round_to_krx_tick(
+                position.avg_price * (1.0 + eff_step_up_pct),
+                side="SELL",
+                round_mode="ceil",
+            )
 
-            # Intra-bar fallback stop if price dropped back below +3.0% during tick feed
-            if tick is not None and tick.price < tp_price:
+            # Fallback stop if price dropped back below +3.0% at bar close
+            if bar.close < tp_price:
                 return self._make_signal(position, current_dt, exit_exec_price, "REALTIME_TP_FALLBACK_STOP")
 
-            # Candle close evaluation in bar mode
-            if bar is not None:
-                eff_step_up_pct = position.metadata.get("step_up_pct", self.step_up_pct)
-                step2_price = round_to_krx_tick(
-                    position.avg_price * (1.0 + eff_step_up_pct),
-                    side="SELL",
-                    round_mode="ceil",
-                )
+            # Normal +3.0% close exit if close did not reach +3.5% (or if step-up holding is disabled)
+            if not self.step_up_enabled or bar.close < step2_price:
+                return self._make_signal(position, current_dt, bar.close, "SMART_TP_CLOSE_1M_NORMAL")
 
-                # Fallback stop if price dropped back below +3.0%
-                if bar.close < tp_price:
-                    return self._make_signal(position, current_dt, exit_exec_price, "REALTIME_TP_FALLBACK_STOP")
-
-                # Normal +3.0% close exit if close did not reach +3.5% (or if step-up holding is disabled)
-                if not self.step_up_enabled or bar.close < step2_price:
-                    return self._make_signal(position, current_dt, bar.close, "SMART_TP_CLOSE_1M_NORMAL")
-
-                # Promoted to Super Leader!
-                position.metadata["is_super_leader"] = True
-                position.stop_loss_price = max(position.stop_loss_price, step2_price)
-                position.metadata["step_up_bars_held"] = 0
-                position.metadata["step_up_promoted_dt"] = bar.dt
+            # Promoted to Super Leader!
+            position.metadata["is_super_leader"] = True
+            position.stop_loss_price = max(position.stop_loss_price, step2_price)
+            position.metadata["step_up_bars_held"] = 0
+            position.metadata["step_up_promoted_dt"] = bar.dt
 
         return None
 
@@ -221,7 +214,12 @@ class MorningLeaderExit(IExitPolicy):
             return sig
 
         # 2. Phase 1 -> Phase 2 Transition (Bar 1+) & Holding Bar Tracker
-        is_subsequent = bar is not None and position.entry_dt is not None and bar.dt > position.entry_dt
+        # Compare minute-floored datetimes so sub-second live entry_dt (e.g. 09:02:14) transitions cleanly at 09:03:00
+        is_subsequent = (
+            bar is not None
+            and position.entry_dt is not None
+            and bar.dt.replace(second=0, microsecond=0) > position.entry_dt.replace(second=0, microsecond=0)
+        )
         if is_subsequent:
             last_dt = position.metadata.get("last_bar_dt")
             if bar.dt != last_dt:

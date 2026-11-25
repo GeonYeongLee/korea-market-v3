@@ -344,7 +344,7 @@ def main() -> None:
     bt_parser.add_argument("--end", default="2026-11-02", help="End date (YYYY-MM-DD or YYYYMMDD, default: 2026-11-02)")
     bt_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW (default: 10,000,000)")
     bt_parser.add_argument("--mode", choices=["pessimistic", "optimistic", "dual"], default="pessimistic", help="Ambiguity mode (default: pessimistic)")
-    bt_parser.add_argument("--regime-mode", choices=["all", "bear_only", "all_weather"], default="all", help="Regime gating mode: 'all', 'bear_only', or 'all_weather' (default: all)")
+    bt_parser.add_argument("--regime-mode", choices=["all", "bear_only", "all_weather", "unified"], default="all", help="Regime gating mode: 'all', 'bear_only', 'all_weather', or 'unified' (default: all)")
     bt_parser.add_argument("--slots", type=int, default=None, help="Fixed daily slots (overrides dynamic slots)")
     bt_parser.add_argument("--data-dir", default=None, help="Custom path to daily 1-min parquet data directory")
     bt_parser.add_argument("--min-gap", type=float, default=0.00, help="Min morning gap (default: 0.00 = 0.0%%)")

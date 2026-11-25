@@ -1,9 +1,7 @@
 """
-All-Weather Integrated Exit Policy.
-Encapsulates:
-  - Bull / Normal Market: MorningLeaderExit (Quad-layer exit: emergency SL, body center SL, step-up TP, 15:21 timeout)
-  - Bear Market: TrailingLockExit (-1.5% hard SL, +2.5% TP1 -> +1.0% lock & 1.5% trailing, 15:19 timeout)
-Dynamically delegates based on daily market regime (is_bear_market) determined at on_day_open.
+All-Weather Unified Exit Policy.
+Uses the empirically validated MorningLeaderExit across ALL market regimes:
+  - Dynamic ATR-based TP/SL, Phase 2 Ref Body Center SL, Smart Step-Up Super Leader hold, 15:21 timeout.
 """
 from __future__ import annotations
 
@@ -15,15 +13,13 @@ from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_fe
 from engine.models import MinuteBar, TickData, Position, ExitSignal
 from strategy.base import IExitPolicy
 from strategy.exits.morning_leader_exit import MorningLeaderExit
-from strategy.exits.trailing_lock_exit import TrailingLockExit
 
 logger = logging.getLogger("korea_market.strategy.all_weather_exit")
 
 
 class AllWeatherExit(IExitPolicy):
     """
-    Composite Exit Policy that dynamically delegates to MorningLeaderExit
-    or TrailingLockExit based on dual-index MA20 trend regime.
+    Unified Exit Policy delegating to MorningLeaderExit across both Bull and Bear regimes.
     """
 
     name: str = "all_weather_exit"
@@ -41,22 +37,22 @@ class AllWeatherExit(IExitPolicy):
         self.feature_provider = feature_provider
         self._ambiguity_mode = ambiguity_mode
 
-        # Bull exit configuration
-        b_kwargs = (bull_kwargs or {}).copy()
-        b_kwargs.setdefault("ambiguity_mode", ambiguity_mode)
-        self.bull_exit = bull_exit or MorningLeaderExit(**b_kwargs)
+        u_kwargs = (bull_kwargs or {}).copy()
+        u_kwargs.setdefault("ambiguity_mode", ambiguity_mode)
+        u_kwargs.setdefault("use_dynamic_targets", True)
+        self.bull_exit = bull_exit or MorningLeaderExit(**u_kwargs)
 
-        # Bear exit configuration: TrailingLockExit (-1.5% SL, +2.5% TP1 -> +1.0% lock, 1.5% trail, 15:19 EOD)
-        br_kwargs = (bear_kwargs or {}).copy()
-        br_kwargs.setdefault("hard_sl_pct", -0.015)
-        br_kwargs.setdefault("tp1_pct", 0.025)
-        br_kwargs.setdefault("lock_profit_pct", 0.010)
-        br_kwargs.setdefault("trailing_offset_pct", 0.015)
-        br_kwargs.setdefault("hard_timeout", time(15, 19))
-        br_kwargs.setdefault("ambiguity_mode", ambiguity_mode)
-        self.bear_exit = bear_exit or TrailingLockExit(**br_kwargs)
+        if bear_exit is not None:
+            self.bear_exit = bear_exit
+        elif bear_kwargs:
+            br_kwargs = bear_kwargs.copy()
+            br_kwargs.setdefault("ambiguity_mode", ambiguity_mode)
+            br_kwargs.setdefault("use_dynamic_targets", True)
+            self.bear_exit = MorningLeaderExit(**br_kwargs)
+        else:
+            self.bear_exit = self.bull_exit
 
-        self.is_bear_market: bool = True  # Safe default matching mock audit date (2024-10-21)
+        self.is_bear_market: bool = False
         self._current_date: Optional[date] = None
 
     @property
@@ -66,11 +62,11 @@ class AllWeatherExit(IExitPolicy):
 
     @property
     def emergency_sl_pct(self) -> float:
-        return getattr(self.active_exit, "emergency_sl_pct", getattr(self.active_exit, "hard_sl_pct", -0.015))
+        return getattr(self.active_exit, "emergency_sl_pct", getattr(self.active_exit, "hard_sl_pct", -0.020))
 
     @property
     def tp_target_pct(self) -> float:
-        return getattr(self.active_exit, "tp_target_pct", getattr(self.active_exit, "tp1_pct", 0.025))
+        return getattr(self.active_exit, "tp_target_pct", getattr(self.active_exit, "tp1_pct", 0.030))
 
     @property
     def hard_timeout(self) -> time:
@@ -85,7 +81,7 @@ class AllWeatherExit(IExitPolicy):
         self._ambiguity_mode = value
         if hasattr(self.bull_exit, "ambiguity_mode"):
             self.bull_exit.ambiguity_mode = value
-        if hasattr(self.bear_exit, "ambiguity_mode"):
+        if self.bear_exit is not self.bull_exit and hasattr(self.bear_exit, "ambiguity_mode"):
             self.bear_exit.ambiguity_mode = value
 
     def on_day_open(self, current_date: date) -> None:
@@ -95,7 +91,8 @@ class AllWeatherExit(IExitPolicy):
         self.is_bear_market = bool(idx_feat.is_bear_market)
 
         self.bull_exit.on_day_open(current_date)
-        self.bear_exit.on_day_open(current_date)
+        if self.bear_exit is not self.bull_exit:
+            self.bear_exit.on_day_open(current_date)
 
     def on_position_opened(self, position: Position) -> None:
         if position.entry_dt is not None:

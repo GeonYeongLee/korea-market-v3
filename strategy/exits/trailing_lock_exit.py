@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from datetime import date, datetime, time
-from typing import Optional
+from typing import Optional, Any
 
 from core.krx_ticks import round_to_krx_tick
 from core.telemetry import telemetry

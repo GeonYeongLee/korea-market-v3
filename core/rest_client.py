@@ -210,8 +210,6 @@ class KISRestClient:
             if not code:
                 continue
             to = float(it.get("acml_tr_pbmn") or 0.0)
-            if to < 100_000_000:
-                to *= 1_000_000.0
             vol = int(it.get("acml_vol") or 0)
             item_copy = dict(it)
             item_copy["_krx_to"] = to
@@ -226,8 +224,6 @@ class KISRestClient:
             if not code:
                 continue
             to = float(it.get("acml_tr_pbmn") or 0.0)
-            if to < 100_000_000:
-                to *= 1_000_000.0
             vol = int(it.get("acml_vol") or 0)
             if code in merged:
                 merged[code]["_nxt_to"] = to

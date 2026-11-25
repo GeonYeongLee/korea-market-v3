@@ -346,11 +346,24 @@ class KisLiveBroker(IBroker):
                     return order.order_id
 
                 with self._lock:
-                    if odno and odno in self._early_executions:
-                        self._early_executions.pop(odno, None)
-                        order.status = OrderStatus.FILLED
+                    early = self._early_executions.pop(odno, None) if odno else None
+                    if early is not None:
+                        early_qty = int(early.get("qty", 0)) if isinstance(early, dict) else int(order.quantity)
+                        if early_qty >= order.quantity:
+                            order.unfilled_quantity = 0
+                            order.status = OrderStatus.FILLED
+                            logger.info(
+                                f"[{self.mode.upper()}] Order {odno} matched early execution notice ({early_qty}/{order.quantity}); marked FILLED immediately."
+                            )
+                            return order.order_id
+                        order.unfilled_quantity = max(0, order.quantity - early_qty)
+                        order.status = OrderStatus.PARTIALLY_FILLED
+                        if order.created_at is None:
+                            order.created_at = datetime.now()
+                        self._pending_orders[order.order_id] = order
+                        self._order_submit_time[order.order_id] = time.time()
                         logger.info(
-                            f"[{self.mode.upper()}] Order {odno} matched early execution notice; marked FILLED immediately."
+                            f"[{self.mode.upper()}] Order {odno} matched early partial execution ({early_qty}/{order.quantity}); tracking remaining {order.unfilled_quantity}."
                         )
                         return order.order_id
 
@@ -599,7 +612,9 @@ class KisLiveBroker(IBroker):
                 self._pending_orders.pop(order_no, None)
                 self._order_submit_time.pop(order_no, None)
                 if order_no:
-                    self._early_executions[order_no] = notice
+                    prev = self._early_executions.get(order_no)
+                    prev_qty = int(prev.get("qty", 0)) if isinstance(prev, dict) else 0
+                    self._early_executions[order_no] = {"qty": prev_qty + filled_qty, "notice": notice}
 
             self._apply_position_fill(symbol, filled_qty, filled_p, side)
 

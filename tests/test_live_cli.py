@@ -221,4 +221,54 @@ def test_cli_check_live_invocation():
             mock_check.assert_called_once_with(env_override="vts", skip_ws=True)
 
 
+def test_rest_client_volume_rank_no_small_krw_inflation():
+    """Verify <100M KRW turnover is NOT multiplied by 1,000,000 in UN merge."""
+    from core.rest_client import KISRestClient
+    from config.settings import Settings
+    from core.rate_limiter import RateLimiter
+
+    client = KISRestClient(cfg=Settings(env="vts"), limiter=RateLimiter(rate=100.0, capacity=10.0))
+    with patch.object(
+        client,
+        "_fetch_volume_rank_single",
+        side_effect=[
+            [{"mksc_shrn_iscd": "005930", "acml_tr_pbmn": "50000000", "acml_vol": "1000"}],
+            [],
+        ],
+    ):
+        items = client.get_volume_rank(market_div="UN")
+        assert len(items) == 1
+        assert items[0]["_tot_to"] == 50_000_000.0
+
+
+def test_composite_tick_entry_and_no_duplicate_sell_storm():
+    """Verify live on_tick triggers breakout entry immediately & blocks duplicate SELL ticks while pending."""
+    from engine.models import TickData, Position, MinuteBar
+    from strategy.registry import build_strategy
+
+    strategy = build_strategy(scanner_name="all_weather", entry_name="all_weather", exit_name="all_weather", dynamic=True)
+    ctx = MagicMock()
+    ctx.get_balance.return_value = MagicMock(cash=10_000_000.0)
+    pos_holder = {}
+    ctx.get_position.side_effect = lambda sym: pos_holder.get(sym)
+    ctx.buy.return_value = "ORD_BUY_1"
+    ctx.liquidate.return_value = "ORD_SELL_1"
+
+    strategy.on_day_open(ctx, date(2026, 11, 16))
+    strategy.register_symbol_day_open("999990", day_open=50000.0, day_low=50000.0, prev_close=50000.0)
+    b1 = MinuteBar("999990", datetime(2026, 11, 16, 9, 1), 50000.0, 52000.0, 50000.0, 51500.0, 60000, turnover=3.0e9, cum_turnover=3.0e9)
+    strategy.register_symbol_minute_bars("999990", [b1], day_open=50000.0, prev_close=50000.0, is_promoted=True)
+    assert "999990" in strategy._active_candidates
+
+    tick_entry = TickData(symbol="999990", dt=datetime(2026, 11, 16, 9, 2, 12), price=52300.0, volume=100, turnover=5.23e6, cum_turnover=3.1e9, day_open=50000.0, day_low=50000.0)
+    strategy.on_tick(ctx, tick_entry)
+    assert ctx.buy.call_count == 1
+    assert "999990" in strategy._pending_buy_symbols
+
+    pos_holder["999990"] = Position(symbol="999990", quantity=90, avg_price=52300.0, current_price=52300.0, high_water_mark=52300.0, entry_dt=datetime(2026, 11, 16, 9, 2, 12), stop_loss_price=51500.0, take_profit_price=54500.0)
+    strategy.on_tick(ctx, TickData(symbol="999990", dt=datetime(2026, 11, 16, 9, 3, 1), price=51400.0, volume=10))
+    strategy.on_tick(ctx, TickData(symbol="999990", dt=datetime(2026, 11, 16, 9, 3, 2), price=51300.0, volume=10))
+    assert ctx.liquidate.call_count == 1
+
+
 

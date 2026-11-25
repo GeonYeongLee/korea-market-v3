@@ -217,24 +217,16 @@ class TickToBarAggregator:
         if symbol not in self.builders:
             self.builders[symbol] = SymbolBarBuilder(symbol)
 
+        builder = self.builders[symbol]
         # 1. Process bar builder first
-        completed_bar = self.builders[symbol].on_tick(tick)
+        completed_bar = builder.on_tick(tick)
+        now = tick.dt if isinstance(tick, TickData) else (tick.get("dt") if isinstance(tick.get("dt"), datetime) else (builder.last_dt or datetime.now()))
+        if isinstance(tick, TickData):
+            tick.dt = now
+        elif isinstance(tick, dict) and "dt" not in tick:
+            tick = dict(tick, dt=now)
 
-        # 2. Dispatch immediate tick-level risk callback
-        now = tick.dt if isinstance(tick, TickData) else (tick.get("dt") if isinstance(tick.get("dt"), datetime) else datetime.now())
-        for tcb in self._tick_callbacks:
-            try:
-                res = _safe_dispatch_tick(tcb, symbol, tick, now)
-                if asyncio.iscoroutine(res):
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(res)
-                    except RuntimeError:
-                        asyncio.run(res)
-            except Exception as e:
-                logger.error(f"Error in tick callback for {symbol}: {e}")
-
-        # 3. Dispatch finalized bar if minute rolled over
+        # 2. Dispatch finalized bar FIRST on minute rollover so bar M settles before tick M+1
         if completed_bar is not None:
             for bcb in self._bar_callbacks:
                 try:
@@ -247,6 +239,19 @@ class TickToBarAggregator:
                             asyncio.run(res)
                 except Exception as e:
                     logger.error(f"Error in bar callback for {symbol}: {e}", exc_info=True)
+
+        # 3. Dispatch immediate tick-level risk callback with aligned timestamp
+        for tcb in self._tick_callbacks:
+            try:
+                res = _safe_dispatch_tick(tcb, symbol, tick, now)
+                if asyncio.iscoroutine(res):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(res)
+                    except RuntimeError:
+                        asyncio.run(res)
+            except Exception as e:
+                logger.error(f"Error in tick callback for {symbol}: {e}")
 
         return completed_bar
 
@@ -262,20 +267,16 @@ class TickToBarAggregator:
         if symbol not in self.builders:
             self.builders[symbol] = SymbolBarBuilder(symbol)
 
+        builder = self.builders[symbol]
         # 1. Process bar builder first
-        completed_bar = self.builders[symbol].on_tick(tick)
+        completed_bar = builder.on_tick(tick)
+        now = tick.dt if isinstance(tick, TickData) else (tick.get("dt") if isinstance(tick.get("dt"), datetime) else (builder.last_dt or datetime.now()))
+        if isinstance(tick, TickData):
+            tick.dt = now
+        elif isinstance(tick, dict) and "dt" not in tick:
+            tick = dict(tick, dt=now)
 
-        # 2. Dispatch immediate tick-level risk callback
-        now = tick.dt if isinstance(tick, TickData) else (tick.get("dt") if isinstance(tick.get("dt"), datetime) else datetime.now())
-        for tcb in self._tick_callbacks:
-            try:
-                res = _safe_dispatch_tick(tcb, symbol, tick, now)
-                if asyncio.iscoroutine(res):
-                    await res
-            except Exception as e:
-                logger.error(f"Error in tick callback for {symbol}: {e}")
-
-        # 3. Dispatch finalized bar if minute rolled over
+        # 2. Dispatch finalized bar FIRST on minute rollover so bar M settles before tick M+1
         if completed_bar is not None:
             for bcb in self._bar_callbacks:
                 try:
@@ -284,6 +285,15 @@ class TickToBarAggregator:
                         await res
                 except Exception as e:
                     logger.error(f"Error in bar callback for {symbol}: {e}", exc_info=True)
+
+        # 3. Dispatch immediate tick-level risk callback
+        for tcb in self._tick_callbacks:
+            try:
+                res = _safe_dispatch_tick(tcb, symbol, tick, now)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                logger.error(f"Error in tick callback for {symbol}: {e}")
 
         return completed_bar
 
