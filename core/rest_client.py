@@ -167,7 +167,7 @@ class KISRestClient:
             logger.warning(f"get_volume_rank({market_div}) returned code {data.get('rt_cd')}: {data.get('msg1')}")
             return []
 
-        return data.get("output", [])
+        return data.get("output") or []
 
     def get_volume_rank(
         self,
@@ -210,8 +210,6 @@ class KISRestClient:
             if not code:
                 continue
             to = float(it.get("acml_tr_pbmn") or 0.0)
-            if to < 100_000_000:
-                to *= 1_000_000.0
             vol = int(it.get("acml_vol") or 0)
             item_copy = dict(it)
             item_copy["_krx_to"] = to
@@ -226,8 +224,6 @@ class KISRestClient:
             if not code:
                 continue
             to = float(it.get("acml_tr_pbmn") or 0.0)
-            if to < 100_000_000:
-                to *= 1_000_000.0
             vol = int(it.get("acml_vol") or 0)
             if code in merged:
                 merged[code]["_nxt_to"] = to
@@ -285,7 +281,7 @@ class KISRestClient:
         if data.get("rt_cd") != "0":
             logger.warning(f"get_fluctuation_rank({market_div}) returned code {data.get('rt_cd')}: {data.get('msg1')}")
             return []
-        return data.get("output", [])
+        return data.get("output") or []
 
     def get_fluctuation_rank(
         self,
@@ -376,7 +372,7 @@ class KISRestClient:
         resp = self._send_request("GET", url, headers=headers, params=params, timeout=5)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("output", {})
+        return data.get("output") or {}
 
     def get_today_minute_bars(
         self,
@@ -411,7 +407,7 @@ class KISRestClient:
             resp.raise_for_status()
             data = resp.json()
             if data.get("rt_cd") == "0":
-                bars = data.get("output2", [])
+                bars = data.get("output2") or []
         except Exception as e:
             logger.debug(f"get_today_minute_bars({symbol}, {market_div}) failed: {e}")
 
@@ -426,7 +422,7 @@ class KISRestClient:
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("rt_cd") == "0":
-                    bars = data.get("output2", [])
+                    bars = data.get("output2") or []
             except Exception as e:
                 logger.warning(f"get_today_minute_bars fallback to 'J' failed for {symbol}: {e}")
 
@@ -452,7 +448,7 @@ class KISRestClient:
         if data.get("rt_cd") != "0":
             logger.warning(f"get_condition_search_title returned {data.get('rt_cd')}: {data.get('msg1')}")
             return []
-        return data.get("output2", []) or data.get("output", [])
+        return data.get("output2") or data.get("output") or []
 
     def get_condition_search_result(self, seq: str = "0") -> List[Dict[str, Any]]:
         """
@@ -475,7 +471,7 @@ class KISRestClient:
         if data.get("rt_cd") != "0":
             logger.warning(f"get_condition_search_result(seq={seq}) returned {data.get('rt_cd')}: {data.get('msg1')}")
             return []
-        return data.get("output2", []) or data.get("output", [])
+        return data.get("output2") or data.get("output") or []
 
     # =========================================================================
     # 2. Account & Balance APIs
@@ -506,8 +502,8 @@ class KISRestClient:
         resp.raise_for_status()
         data = resp.json()
         return {
-            "holdings": data.get("output1", []),
-            "summary": data.get("output2", [{}])[0] if data.get("output2") else {},
+            "holdings": data.get("output1") or [],
+            "summary": (data.get("output2") or [{}])[0] if (data.get("output2") or []) else {},
         }
 
     # =========================================================================
@@ -663,7 +659,7 @@ class KISRestClient:
         resp = self._send_request("GET", url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("output1", [])
+        return data.get("output1") or []
 
     def get_kospi_gap_and_market_regime(self) -> Dict[str, Any]:
         """

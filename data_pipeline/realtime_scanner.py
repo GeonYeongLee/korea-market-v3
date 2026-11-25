@@ -147,8 +147,10 @@ class RealtimeLeaderScanner:
             entry_mod = getattr(strategy, "entry", None)
             if entry_mod:
                 val_bo = getattr(entry_mod, "breakout_threshold_pct", None)
+                if val_bo is None:
+                    val_bo = getattr(entry_mod, "breakout_pct", None)
                 if isinstance(val_bo, (int, float)):
-                    strat_bo = float(val_bo)
+                    strat_bo = float(val_bo) * 100.0 if abs(float(val_bo)) < 0.5 else float(val_bo)
 
         self.min_turnover_krw = min_turnover_krw if min_turnover_krw is not None else (strat_to * 0.8)
         self.min_gain_pct = min_gain_pct if min_gain_pct is not None else max(2.5, strat_bo - 1.0)
@@ -242,7 +244,10 @@ class RealtimeLeaderScanner:
                         self.strategy.register_symbol_minute_bars(symbol, raw_bars, is_promoted=True)
 
                     parsed_bars = parse_kis_minute_bars(symbol, raw_bars)
+                    curr_min_dt = datetime.now().replace(second=0, microsecond=0)
                     for bar in parsed_bars:
+                        if bar.dt.replace(second=0, microsecond=0) >= curr_min_dt:
+                            continue  # Skip forming current-minute bar to avoid intra-minute contamination
                         if self.strategy and hasattr(self.strategy, "scanner") and hasattr(self.strategy.scanner, "on_bar"):
                             self.strategy.scanner.on_bar(bar.date, bar)
                     logger.info(f"📊 [{symbol}] Synced & registered {len(parsed_bars)} 1-minute bars to scanner indicators.")
@@ -437,20 +442,41 @@ class RealtimeLeaderScanner:
                             existing_codes = {str(it.get("code", "")).strip() for it in items}
                             for r in rank_items[:30]:  # Top 30 UN turnover leaders
                                 r_code = str(r.get("mksc_shrn_iscd") or r.get("stck_shrn_iscd") or "").strip()
-                                if r_code and r_code not in existing_codes and self._is_target_stock(r_code):
+                                r_name = str(r.get("hts_kor_isnm", "") or "")
+                                if r_code and r_code not in existing_codes and self._is_target_stock(r_code, name=r_name):
                                     stck_prpr = str(r.get("stck_prpr", "0") or "0")
                                     if float(stck_prpr or 0.0) > 0:
                                         tot_to = float(r.get("_tot_to", 0.0) or r.get("acml_tr_pbmn", 0.0) or 0.0)
+                                        op_str = str(r.get("stck_oprc", "0") or "0")
+                                        hp_str = str(r.get("stck_hgpr", "0") or "0")
+                                        lp_str = str(r.get("stck_lwpr", "0") or "0")
+                                        chg_str = str(r.get("prdy_ctrt", "0") or "0")
+
+                                        # FHPST01710000 volume rank often omits intraday open/high/low; fallback to KRX quote when missing
+                                        if float(op_str) <= 0 or float(hp_str) <= 0 or float(lp_str) <= 0:
+                                            try:
+                                                p_j = self.client.get_current_price(r_code, market_div="J")
+                                                if p_j and float(p_j.get("stck_prpr", 0.0) or 0.0) > 0:
+                                                    stck_prpr = str(p_j.get("stck_prpr", stck_prpr) or stck_prpr)
+                                                    op_str = str(p_j.get("stck_oprc", op_str) or op_str)
+                                                    hp_str = str(p_j.get("stck_hgpr", hp_str) or hp_str)
+                                                    lp_str = str(p_j.get("stck_lwpr", lp_str) or lp_str)
+                                                    chg_str = str(p_j.get("prdy_ctrt", chg_str) or chg_str)
+                                                    if not r_name:
+                                                        r_name = str(p_j.get("rprs_mrkt_kor_name", "") or "")
+                                            except Exception as q_err:
+                                                logger.debug(f"VolumeRank candidate quote fallback failed for {r_code}: {q_err}")
+
                                         norm_item = {
                                             "code": r_code,
-                                            "name": str(r.get("hts_kor_isnm", "") or ""),
+                                            "name": r_name,
                                             "price": stck_prpr,
-                                            "open": str(r.get("stck_oprc", "0") or "0"),
-                                            "high": str(r.get("stck_hgpr", "0") or "0"),
-                                            "low": str(r.get("stck_lwpr", "0") or "0"),
+                                            "open": op_str,
+                                            "high": hp_str,
+                                            "low": lp_str,
                                             "trade_amt": str(tot_to / 1000.0),
                                             "acml_vol": str(r.get("acml_vol", "0") or "0"),
-                                            "chgrate": str(r.get("prdy_ctrt", "0") or "0"),
+                                            "chgrate": chg_str,
                                             "_source": "VOLUME_RANK_UN",
                                         }
                                         items.append(norm_item)

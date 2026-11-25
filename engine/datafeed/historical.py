@@ -159,11 +159,14 @@ class HistoricalDataFeed(IDataFeed):
                 filter_morning = filter_morning & ds.field("symbol").isin(list(self.symbols))
 
             table_am = ds_obj.to_table(columns=available_cols, filter=filter_morning)
+            late_open_full_day = False
             if table_am.num_rows == 0:
-                # Late-open fallback: if no bars <= 09:30, check entire day
-                table_am = ds_obj.to_table(columns=available_cols)
+                # Late-open fallback: load entire day once (respecting self.symbols) and skip redundant pm pass
+                late_filter = ds.field("symbol").isin(list(self.symbols)) if self.symbols else None
+                table_am = ds_obj.to_table(columns=available_cols, filter=late_filter)
                 if table_am.num_rows == 0:
                     return
+                late_open_full_day = True
 
             cum_turnover_tracker: Dict[str, float] = {}
             state: Dict[str, Any] = {
@@ -174,16 +177,21 @@ class HistoricalDataFeed(IDataFeed):
 
             yield from self._yield_bars_from_table(table_am, available_cols, cum_turnover_tracker, state)
 
-            if state["is_day_done"]:
+            if state["is_day_done"] or late_open_full_day:
                 return
 
             # Coordinated afternoon pushdown: load only active held symbols past cutoff
             if self.filter_provider is not None:
                 last_dt = state.get("last_dt") or cutoff_dt
                 is_done, active_syms = self.filter_provider(last_dt)
-                if is_done or not active_syms:
+                if is_done or (active_syms is not None and len(active_syms) == 0):
                     return
-                filter_pm = (ds.field("timestamp") > cutoff_scalar) & ds.field("symbol").isin(list(active_syms))
+                if active_syms is not None:
+                    filter_pm = (ds.field("timestamp") > cutoff_scalar) & ds.field("symbol").isin(list(active_syms))
+                else:
+                    filter_pm = ds.field("timestamp") > cutoff_scalar
+                    if self.symbols:
+                        filter_pm = filter_pm & ds.field("symbol").isin(list(self.symbols))
             else:
                 filter_pm = ds.field("timestamp") > cutoff_scalar
                 if self.symbols:
@@ -244,6 +252,7 @@ class HistoricalDataFeed(IDataFeed):
         cum_turnover_tracker = {}
         last_dt = None
         has_filter = self.filter_provider is not None
+        active_symbols: Optional[Set[str]] = None
 
         for row in combined[actual_cols].itertuples(index=False, name=None):
             dt_val = row[dt_idx]

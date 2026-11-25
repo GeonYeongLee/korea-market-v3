@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import date, time
 from typing import Optional, List, Dict, Set, Any
 
@@ -41,6 +42,7 @@ class CompositeStrategy(BaseStrategy):
         self.name = name
 
         self.current_slot_notional: float = (total_capital / max(1, max_daily_positions)) if max_daily_positions > 0 else 0.0
+        self._lock = threading.RLock()
         self._active_candidates: Set[str] = set()
         self._active_positions: Set[str] = set()
         self._daily_trade_count: int = 0
@@ -172,8 +174,17 @@ class CompositeStrategy(BaseStrategy):
             exit_signal = self.exit_policy.evaluate_exit(position, bar)
             if exit_signal:
                 has_target = exit_signal.target_price is not None and exit_signal.target_price > 0
-                is_sl = "SL" in exit_signal.reason or "STOP" in exit_signal.reason
-                exec_price = min(bar.open, exit_signal.target_price) if (is_sl and has_target) else bar.close
+                reason_up = (exit_signal.reason or "").upper()
+                is_sl = (
+                    ("SL" in reason_up or "HARD_STOP_LOSS" in reason_up or "TRAILING_STOP" in reason_up)
+                    and "TP_FALLBACK" not in reason_up
+                )
+                if is_sl and has_target:
+                    exec_price = min(bar.open, exit_signal.target_price)
+                elif has_target:
+                    exec_price = exit_signal.target_price
+                else:
+                    exec_price = bar.close
                 tgt_str = f"{exit_signal.target_price:,.0f}" if has_target else "N/A"
                 logger.info(
                     f"🔻 [EXIT SIGNAL] {bar.symbol} Reason: {exit_signal.reason} | "
@@ -249,42 +260,64 @@ class CompositeStrategy(BaseStrategy):
                                 pos.metadata.setdefault("prior_atr20_pct", prior_atr)
                     else:
                         self._pending_ref_bars.pop(bar.symbol, None)
+                        if hasattr(self.entry, "rollback_entered_symbol"):
+                            self.entry.rollback_entered_symbol(bar.symbol)
 
     def on_tick(self, context: Any, tick: TickData) -> None:
-        position: Optional[Position] = context.get_position(tick.symbol)
-        if position and position.quantity > 0:
-            exit_signal = self.exit_policy.evaluate_exit(position, None, tick=tick)
-            if exit_signal:
-                context.liquidate(tick.symbol, price=tick.price, tag=exit_signal.reason)
-                self._active_positions.discard(tick.symbol)
+        with self._lock:
+            position: Optional[Position] = context.get_position(tick.symbol)
+            if position and position.quantity > 0:
+                exit_signal = self.exit_policy.evaluate_exit(position, None, tick=tick)
+                if exit_signal:
+                    has_target = exit_signal.target_price is not None and exit_signal.target_price > 0
+                    exec_price = exit_signal.target_price if has_target else tick.price
+                    context.liquidate(tick.symbol, price=exec_price, tag=exit_signal.reason)
+                    self._active_positions.discard(tick.symbol)
 
     def on_order_event(self, context: Any, event: OrderEvent) -> None:
-        if event.side == OrderSide.BUY:
-            if event.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
-                if event.filled_quantity == 0:
-                    self._daily_trade_count = max(0, self._daily_trade_count - 1)
-                    self._active_positions.discard(event.symbol)
-                    if hasattr(self.entry, "rollback_entered_symbol"):
-                        self.entry.rollback_entered_symbol(event.symbol)
-                self._pending_ref_bars.pop(event.symbol, None)
-            elif event.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
-                self._active_positions.add(event.symbol)
-                position = context.get_position(event.symbol)
-                if position:
-                    ref_bar = self._pending_ref_bars.get(event.symbol)
-                    if ref_bar:
-                        position.metadata.setdefault("ref_bar", ref_bar)
-                        if ref_bar.get("prior_atr20_pct") is not None:
-                            position.metadata.setdefault("prior_atr20_pct", ref_bar["prior_atr20_pct"])
-                    if event.status == OrderStatus.FILLED:
-                        self._pending_ref_bars.pop(event.symbol, None)
+        with self._lock:
+            if event.side == OrderSide.BUY:
+                if event.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
+                    if event.filled_quantity == 0:
+                        rem_pos = context.get_position(event.symbol)
+                        if not rem_pos or rem_pos.quantity <= 0:
+                            self._daily_trade_count = max(0, self._daily_trade_count - 1)
+                            self._active_positions.discard(event.symbol)
+                            if hasattr(self.entry, "rollback_entered_symbol"):
+                                self.entry.rollback_entered_symbol(event.symbol)
+                    self._pending_ref_bars.pop(event.symbol, None)
+                elif event.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+                    self._active_positions.add(event.symbol)
+                    position = context.get_position(event.symbol)
+                    if position:
+                        ref_bar = self._pending_ref_bars.get(event.symbol)
+                        if ref_bar:
+                            position.metadata.setdefault("ref_bar", ref_bar)
+                            if ref_bar.get("prior_atr20_pct") is not None:
+                                position.metadata.setdefault("prior_atr20_pct", ref_bar["prior_atr20_pct"])
+                        if event.status == OrderStatus.FILLED:
+                            self._pending_ref_bars.pop(event.symbol, None)
 
-                    if position.stop_loss_price <= 0.0:
-                        self.exit_policy.on_position_opened(position)
-                    else:
-                        eff_sl = position.metadata.get("emergency_sl_pct", getattr(self.exit_policy, "emergency_sl_pct", -0.020))
-                        eff_tp = position.metadata.get("tp_target_pct", getattr(self.exit_policy, "tp_target_pct", 0.030))
-                        position.stop_loss_price = round_to_krx_tick(position.avg_price * (1.0 + eff_sl), side="SELL", round_mode="ceil")
-                        position.take_profit_price = round_to_krx_tick(position.avg_price * (1.0 + eff_tp), side="SELL", round_mode="ceil")
-        elif event.side == OrderSide.SELL and event.status == OrderStatus.FILLED:
-            self._active_positions.discard(event.symbol)
+                        if position.stop_loss_price <= 0.0:
+                            self.exit_policy.on_position_opened(position)
+                        else:
+                            eff_sl = position.metadata.get(
+                                "emergency_sl_pct",
+                                position.metadata.get(
+                                    "hard_sl_pct",
+                                    getattr(self.exit_policy, "emergency_sl_pct", getattr(self.exit_policy, "hard_sl_pct", -0.020)),
+                                ),
+                            )
+                            eff_tp = position.metadata.get(
+                                "tp_target_pct",
+                                position.metadata.get(
+                                    "tp1_pct",
+                                    getattr(self.exit_policy, "tp_target_pct", getattr(self.exit_policy, "tp1_pct", 0.030)),
+                                ),
+                            )
+                            position.stop_loss_price = round_to_krx_tick(position.avg_price * (1.0 + eff_sl), side="SELL", round_mode="ceil")
+                            position.take_profit_price = round_to_krx_tick(position.avg_price * (1.0 + eff_tp), side="SELL", round_mode="ceil")
+            elif event.side == OrderSide.SELL and event.status == OrderStatus.FILLED:
+                rem_pos = context.get_position(event.symbol)
+                if not rem_pos or rem_pos.quantity <= 0:
+                    self._active_positions.discard(event.symbol)

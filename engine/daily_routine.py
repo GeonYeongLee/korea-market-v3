@@ -190,6 +190,8 @@ class DailyRoutineOrchestrator:
         )
 
         # 09:00:01 스캐너 가동 및 틱 수신 전에 전략 라이프사이클 명시적 호출
+        if hasattr(risk_manager, "on_day_open"):
+            risk_manager.on_day_open(target_date_obj)
         self.strategy.on_day_open(engine.context, target_date_obj)
         engine._current_date = target_date_obj
 
@@ -254,6 +256,9 @@ class DailyRoutineOrchestrator:
             )
 
             try:
+                for sym in open_pos.keys():
+                    logger.info(f"Subscribing pre-existing holding to live feed: {sym}")
+                    datafeed.subscribe_symbol(sym)
                 datafeed.start()
                 time.sleep(1.0)
                 if max_slots > 0:
@@ -264,17 +269,25 @@ class DailyRoutineOrchestrator:
 
                 console.print("[green]✓ 실시간 스캐너 및 웹소켓 호가 엔진이 가동되었습니다. 매매 완료를 실시간 감시합니다...[/green]")
 
-                last_eod_attempt: Dict[str, float] = {}
+                eod_submitted_symbols: set = set()
+                eod_post_synced: bool = False
                 loop_start_ts: float = time.time()
                 last_watchdog_reboot: float = 0.0
+                last_stale_buy_check: float = 0.0
 
                 while True:
                     time.sleep(1.0)
                     curr_t = datetime.now().time()
                     now_ts = time.time()
 
-                    # Feed Watchdog (09:00:15 ~ 15:20)
-                    if curr_t >= dtime(9, 0, 15) and curr_t < dtime(15, 20, 0):
+                    # Cancel stale unfilled BUY bids > 45s every 5s to prevent dump fills
+                    if now_ts - last_stale_buy_check >= 5.0:
+                        last_stale_buy_check = now_ts
+                        if hasattr(broker, "cancel_stale_buy_orders"):
+                            broker.cancel_stale_buy_orders(max_age_sec=45.0)
+
+                    # Feed Watchdog (09:00:15 ~ 15:30:00, covers closing call auction notices)
+                    if curr_t >= dtime(9, 0, 15) and curr_t < dtime(15, 30, 0):
                         ws_c = getattr(datafeed, "ws_client", None)
                         ws_state = getattr(ws_c, "connection_state", "CONNECTED") if ws_c else "CONNECTED"
                         active_syms = getattr(datafeed, "active_symbols", [])
@@ -304,46 +317,53 @@ class DailyRoutineOrchestrator:
                             elif hasattr(datafeed, "hard_reconnect"):
                                 datafeed.hard_reconnect()
 
-                    # 15:20 KRX 장마감 동시호가 전량 청산 (오버나잇 0% 불변량, 15:28:00까지 지속 재시도)
-                    if curr_t >= dtime(15, 20, 0) and curr_t <= dtime(15, 28, 0):
+                    # 15:20 KRX 장마감 동시호가 전량 청산 (종목당 1회 접수; 15:30 단일가 체결 보존)
+                    if curr_t >= dtime(15, 20, 0) and curr_t <= dtime(15, 29, 0):
                         open_pos = broker.get_positions()
                         if open_pos:
                             from engine.models import Order, OrderSide, OrderType
                             for sym, p in list(open_pos.items()):
-                                if p.quantity > 0:
-                                    last_att = last_eod_attempt.get(sym, 0.0)
-                                    if time.time() - last_att >= 2.0:
-                                        last_eod_attempt[sym] = time.time()
-                                        console.print(
-                                            f"\n[bold yellow]⚠️ [STAGE 3] 15:20 KRX 장마감 동시호가 청산 집행: {sym} ({p.quantity}주)[/bold yellow]"
-                                        )
-                                        # First cancel resting orders to avoid '매도가능수량 부족'
-                                        broker.cancel_pending_orders(sym)
-                                        time.sleep(0.5)
-                                        curr_p = broker.get_position(sym)
-                                        if curr_p and curr_p.quantity > 0:
-                                            broker.submit_order(Order(
-                                                order_id=f"EOD_{sym}_{int(time.time())}",
-                                                symbol=sym,
-                                                side=OrderSide.SELL,
-                                                order_type=OrderType.MARKET,
-                                                quantity=curr_p.quantity,
-                                                tag="EOD_AUCTION_1520",
-                                            ))
+                                if p.quantity > 0 and sym not in eod_submitted_symbols:
+                                    eod_submitted_symbols.add(sym)
+                                    console.print(
+                                        f"\n[bold yellow]⚠️ [STAGE 3] 15:20 KRX 장마감 동시호가 청산 집행: {sym} ({p.quantity}주)[/bold yellow]"
+                                    )
+                                    # Cancel resting intraday orders once before submitting closing auction order
+                                    broker.cancel_pending_orders(sym)
+                                    time.sleep(0.3)
+                                    curr_p = broker.get_position(sym)
+                                    if curr_p and curr_p.quantity > 0:
+                                        broker.submit_order(Order(
+                                            order_id=f"EOD_{sym}_{int(time.time())}",
+                                            symbol=sym,
+                                            side=OrderSide.SELL,
+                                            order_type=OrderType.MARKET,
+                                            quantity=curr_p.quantity,
+                                            tag="EOD_AUCTION_1520",
+                                        ))
 
-                    # Check daily trading completion
+                    # 15:30:05 이후 장마감 단일가 체결 결과 계좌 동기화
+                    if curr_t >= dtime(15, 30, 5) and not eod_post_synced:
+                        eod_post_synced = True
+                        try:
+                            broker.sync_account_state()
+                        except Exception as e_sync:
+                            logger.debug(f"Post-auction account sync failed: {e_sync}")
+
+                    # Check daily trading completion (do not abort while orders are still PENDING)
                     is_done = getattr(self.strategy, "is_daily_trading_completed", False)
                     if callable(is_done):
                         is_done = is_done()
                     open_pos = broker.get_positions()
+                    has_pending = bool(getattr(broker, "_pending_orders", None))
 
-                    if is_done and not open_pos:
+                    if is_done and not open_pos and not has_pending:
                         console.print(
                             f"\n[bold green]🛑 [STAGE 4] 당일 목표 매매 완료 감지: 전량 청산 완료 및 쿼터 소진![/bold green]"
                         )
                         break
 
-                    if curr_t > cutoff_t and not open_pos:
+                    if curr_t > cutoff_t and not open_pos and not has_pending:
                         console.print(
                             f"\n[bold yellow]🛑 [STAGE 4] 골든 윈도우 마감 ({cutoff_str}) 및 보유 잔고 0: 당일 매매 세션을 종료합니다.[/bold yellow]"
                         )
@@ -357,10 +377,14 @@ class DailyRoutineOrchestrator:
                 # =====================================================================
                 console.print("[bold yellow]🔒 [STAGE 4] 스캐너 정지, 웹소켓 연결 해제 및 잔여 주문 정리 중...[/bold yellow]")
                 try:
+                    if hasattr(self.strategy, "on_day_close"):
+                        self.strategy.on_day_close(engine.context, target_date_obj)
                     broker.cancel_pending_orders()
                     if max_slots > 0:
                         scanner.stop()
                     datafeed.stop()
+                    if engine_thread.is_alive():
+                        engine_thread.join(timeout=2.0)
                 except Exception as e:
                     logger.debug(f"Error stopping feeds/cancelling orders: {e}")
 

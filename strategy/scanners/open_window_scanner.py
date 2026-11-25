@@ -111,11 +111,13 @@ class OpenWindowScanner(IScanner):
                 )
                 df = table.to_pandas()
                 df["d_str"] = df["date"].astype(str)
+                df = df.sort_values(["symbol", "d_str"])
+                df["prev_turnover"] = df.groupby("symbol")["turnover"].shift(1).fillna(0.0)
                 close_lookup = {}
                 turnover_lookup = {}
                 for d_str, g in df.groupby("d_str"):
                     close_lookup[d_str] = dict(zip(g["symbol"], g["prev_close"]))
-                    turnover_lookup[d_str] = dict(zip(g["symbol"], g["turnover"]))
+                    turnover_lookup[d_str] = dict(zip(g["symbol"], g["prev_turnover"]))
                 _GLOBAL_PREV_DATA_CACHE = (close_lookup, turnover_lookup)
                 self._prev_close_lookup, self._prev_turnover_lookup = _GLOBAL_PREV_DATA_CACHE
             except Exception:

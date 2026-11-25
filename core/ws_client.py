@@ -8,7 +8,8 @@ import base64
 import json
 import logging
 import asyncio
-from typing import Dict, Any, Callable, Awaitable, Set, Optional
+import threading
+from typing import Dict, Any, Callable, Awaitable, Set, List, Optional
 import websockets
 
 from config.settings import Settings, settings
@@ -41,6 +42,16 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None:
+            return default
+        s = str(v).strip().split(".")[0]
+        return int(s) if s else default
+    except (ValueError, TypeError):
+        return default
+
+
 class KISWebSocketClient:
     """Asynchronous WebSocket streamer for KIS Open API."""
 
@@ -53,8 +64,9 @@ class KISWebSocketClient:
         self.token_mgr = token_mgr or TokenManager(self.cfg)
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
+        self._lock = threading.Lock()
         self._subscribed_symbols: Set[str] = set()
-        self._callbacks: list[TickCallback] = []
+        self._callbacks: List[TickCallback] = []
         self._reconnect_delay = 3.0
         self._aes_key: Optional[str] = None
         self._aes_iv: Optional[str] = None
@@ -69,7 +81,8 @@ class KISWebSocketClient:
 
     def register_callback(self, cb: TickCallback) -> None:
         """Register async callback function for incoming market ticks and executions."""
-        self._callbacks.append(cb)
+        with self._lock:
+            self._callbacks.append(cb)
 
     @property
     def is_healthy(self) -> bool:
@@ -112,7 +125,9 @@ class KISWebSocketClient:
                     logger.info("WebSocket connected successfully.")
 
                     # Resubscribe to previous symbols if reconnecting
-                    for sym in list(self._subscribed_symbols):
+                    with self._lock:
+                        current_subs = list(self._subscribed_symbols)
+                    for sym in current_subs:
                         await self._send_subscription(sym, tr_type="1", approval_key=approval_key)
 
                     # Also subscribe to user execution notice if HTS_ID provided
@@ -132,8 +147,15 @@ class KISWebSocketClient:
             except (websockets.ConnectionClosed, OSError) as e:
                 if self.connection_state != "AUTH_FAILED":
                     self.connection_state = "DISCONNECTED"
+                if not self._running:
+                    logger.info("WebSocket connection closed cleanly during shutdown.")
+                    break
+                if self.connection_state != "AUTH_FAILED":
                     logger.warning(f"WebSocket connection lost: {e}. Reconnecting in {self._reconnect_delay}s...")
                 await asyncio.sleep(self._reconnect_delay)
+            except asyncio.CancelledError:
+                logger.info("WebSocket listener task cancelled.")
+                break
             except Exception as e:
                 err_str = str(e).lower()
                 if "401" in err_str or "403" in err_str or "approval" in err_str or "auth" in err_str:
@@ -143,50 +165,70 @@ class KISWebSocketClient:
                 else:
                     if self.connection_state != "AUTH_FAILED":
                         self.connection_state = "DISCONNECTED"
+                    if not self._running:
+                        break
                     logger.error(f"Unexpected WebSocket error: {e}", exc_info=True)
+                if not self._running:
+                    break
                 await asyncio.sleep(self._reconnect_delay)
+            finally:
+                self._ws = None
+                if self.connection_state != "AUTH_FAILED" and not self._running:
+                    self.connection_state = "DISCONNECTED"
 
     @property
     def is_connected(self) -> bool:
         """Checks whether the underlying WebSocket connection is open."""
-        if not self._ws:
+        ws = self._ws
+        if ws is None:
             return False
-        if hasattr(self._ws, "open"):
-            return bool(self._ws.open)
-        if hasattr(self._ws, "state"):
+        if hasattr(ws, "closed") and ws.closed:
+            return False
+        if hasattr(ws, "open"):
+            return bool(ws.open)
+        if hasattr(ws, "state"):
             try:
-                return self._ws.state == 1 or getattr(self._ws.state, "name", "") == "OPEN"
+                return ws.state == 1 or getattr(ws.state, "name", "") == "OPEN"
             except Exception:
-                return self._ws.state == 1
+                return ws.state == 1
         return True
 
     async def disconnect(self) -> None:
         """Gracefully disconnect WebSocket."""
         self._running = False
         self.connection_state = "DISCONNECTED"
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
+        ws = self._ws
+        self._ws = None
+        if ws:
+            try:
+                await ws.close()
+            except Exception as e:
+                logger.debug(f"Error closing WebSocket: {e}")
 
     async def subscribe_symbol(self, symbol: str) -> None:
         """Subscribe to real-time tick prices for a symbol (H0UNCNT0: 통합 실시간 체결가)."""
-        if symbol in self._subscribed_symbols:
-            return
-        self._subscribed_symbols.add(symbol)
+        with self._lock:
+            if symbol in self._subscribed_symbols:
+                return
+            self._subscribed_symbols.add(symbol)
         if self.is_connected:
             approval_key = self.token_mgr.get_approval_key()
             await self._send_subscription(symbol, tr_type="1", approval_key=approval_key)
 
     async def unsubscribe_symbol(self, symbol: str) -> None:
         """Unsubscribe from real-time tick prices for a symbol."""
-        if symbol not in self._subscribed_symbols:
-            return
-        self._subscribed_symbols.remove(symbol)
+        with self._lock:
+            if symbol not in self._subscribed_symbols:
+                return
+            self._subscribed_symbols.discard(symbol)
         if self.is_connected:
             approval_key = self.token_mgr.get_approval_key()
             await self._send_subscription(symbol, tr_type="2", approval_key=approval_key)
 
     async def _send_subscription(self, symbol: str, tr_type: str, approval_key: str) -> None:
+        ws = self._ws
+        if not ws:
+            return
         payload = {
             "header": {
                 "approval_key": approval_key,
@@ -201,11 +243,17 @@ class KISWebSocketClient:
                 }
             },
         }
-        await self._ws.send(json.dumps(payload))
-        logger.debug(f"WS subscription request sent: {symbol} (tr_type={tr_type})")
+        try:
+            await ws.send(json.dumps(payload))
+            logger.debug(f"WS subscription request sent: {symbol} (tr_type={tr_type})")
+        except Exception as e:
+            logger.warning(f"Failed to send WS subscription for {symbol}: {e}")
 
     async def _subscribe_execution_notice(self, approval_key: str) -> None:
         """Subscribe to real-time account execution notifications (H0STCNI0/H0STCNI9)."""
+        ws = self._ws
+        if not ws:
+            return
         tr_id = "H0STCNI0" if self.cfg.env == "real" else "H0STCNI9"
         payload = {
             "header": {
@@ -221,14 +269,21 @@ class KISWebSocketClient:
                 }
             },
         }
-        await self._ws.send(json.dumps(payload))
-        logger.info(f"Subscribed to execution notifications ({tr_id}) for HTS_ID: {self.cfg.hts_id}")
+        try:
+            await ws.send(json.dumps(payload))
+            logger.info(f"Subscribed to execution notifications ({tr_id}) for HTS_ID: {self.cfg.hts_id}")
+        except Exception as e:
+            logger.warning(f"Failed to subscribe to execution notifications: {e}")
 
     async def _handle_message(self, raw: str) -> None:
         # Check PINGPONG frame and echo back immediately to maintain session
         if "PINGPONG" in raw:
-            if self._ws:
-                await self._ws.send(raw)
+            ws = self._ws
+            if ws:
+                try:
+                    await ws.send(raw)
+                except Exception as e:
+                    logger.debug(f"Failed to echo PINGPONG frame: {e}")
             return
 
         # Case 1: JSON control frame (pingpong, system messages, subscription ack)
@@ -289,36 +344,27 @@ class KISWebSocketClient:
             if len(fields) < 18:
                 return
 
-            # Volume & turnover indexing:
-            # 12: 체결수량 (CNTG_VOL)
-            # 13: 누적체결량 (ACML_VOL)
-            # 14: 누적거래대금 (ACML_TR_PBMN)
-            vol = int(fields[12]) if len(fields) > 12 and fields[12].lstrip("-").isdigit() else (int(fields[11]) if len(fields) > 11 and fields[11].lstrip("-").isdigit() else 0)
-            cum_vol = int(fields[13]) if len(fields) > 13 and fields[13].lstrip("-").isdigit() else (int(fields[12]) if len(fields) > 12 and fields[12].lstrip("-").isdigit() else 0)
-            cum_to = float(fields[14]) if len(fields) > 14 and fields[14].replace(".", "", 1).lstrip("-").isdigit() else (float(fields[13]) if len(fields) > 13 and fields[13].replace(".", "", 1).lstrip("-").isdigit() else 0.0)
+            vol = _safe_int(fields[12]) if len(fields) > 12 else 0
+            cum_vol = _safe_int(fields[13]) if len(fields) > 13 else 0
+            cum_to = _safe_float(fields[14]) if len(fields) > 14 else 0.0
 
             # Volume Power (체결강도 %):
-            # KIS H0STCNT0 fields:
-            # 18: 총 매도수량 (TOTAL_SELN_QTY)
-            # 19: 총 매수수량 (TOTAL_SHNU_QTY)
-            # 체결강도 = (총 매수수량 / 총 매도수량) * 100
+            # KIS H0STCNT0/H0UNCNT0:
+            #   18: CTTR (체결강도), 19: SELN_CNTG_SMTN (총 매도수량), 20: SHNU_CNTG_SMTN (총 매수수량)
             vol_power = 0.0
-            if len(fields) > 19:
-                try:
-                    sel_qty = float(fields[18])
-                    buy_qty = float(fields[19])
-                    if sel_qty > 0:
-                        vol_power = round((buy_qty / sel_qty) * 100.0, 2)
-                except (ValueError, TypeError):
-                    pass
+            if len(fields) > 20:
+                sel_qty = _safe_float(fields[19])
+                buy_qty = _safe_float(fields[20])
+                if sel_qty > 0 and buy_qty > 0:
+                    vol_power = round((buy_qty / sel_qty) * 100.0, 2)
 
-            if vol_power <= 0 and len(fields) > 17:
-                try:
-                    fallback_val = float(fields[17])
-                    if fallback_val > 0:
-                        vol_power = fallback_val
-                except (ValueError, TypeError):
-                    pass
+            if vol_power <= 0 and len(fields) > 19:
+                sel_or_cttr = _safe_float(fields[18])
+                buy_or_seln = _safe_float(fields[19])
+                if sel_or_cttr > 0 and buy_or_seln > 0 and len(fields) <= 20:
+                    vol_power = round((buy_or_seln / sel_or_cttr) * 100.0, 2)
+                elif sel_or_cttr > 0:
+                    vol_power = round(sel_or_cttr, 2)
 
             if vol_power <= 0:
                 vol_power = 120.0  # safe fallback
@@ -354,7 +400,9 @@ class KISWebSocketClient:
                 },
             )
 
-            for cb in self._callbacks:
+            with self._lock:
+                tick_callbacks = list(self._callbacks)
+            for cb in tick_callbacks:
                 try:
                     await cb("TICK", tick)
                 except Exception as e:
@@ -404,8 +452,8 @@ class KISWebSocketClient:
                     "order_no": fields[2],
                     "symbol": sym,
                     "side": "BUY" if fields[4] == "02" else "SELL",
-                    "qty": int(fields[9]) if fields[9].isdigit() else 0,
-                    "price": float(fields[10]) if fields[10].replace(".", "", 1).isdigit() else 0.0,
+                    "qty": _safe_int(fields[9]),
+                    "price": _safe_float(fields[10]),
                 }
             else:
                 exec_notice = {
@@ -413,8 +461,8 @@ class KISWebSocketClient:
                     "order_no": fields[1] if len(fields) > 1 else "",
                     "symbol": sym,
                     "side": "BUY" if len(fields) > 4 and fields[4] == "02" else "SELL",
-                    "qty": int(fields[5]) if len(fields) > 5 and fields[5].isdigit() else 0,
-                    "price": float(fields[6]) if len(fields) > 6 else 0.0,
+                    "qty": _safe_int(fields[5]) if len(fields) > 5 else 0,
+                    "price": _safe_float(fields[6]) if len(fields) > 6 else 0.0,
                 }
 
             telemetry.record_ws_frame(
@@ -424,7 +472,9 @@ class KISWebSocketClient:
                 data=exec_notice,
             )
 
-            for cb in self._callbacks:
+            with self._lock:
+                exec_callbacks = list(self._callbacks)
+            for cb in exec_callbacks:
                 try:
                     await cb("EXECUTION", exec_notice)
                 except Exception as e:

@@ -84,7 +84,7 @@ def build_strategy(
     x_kwargs = (exit_kwargs or {}).copy()
     if "ambiguity_mode" not in x_kwargs:
         x_kwargs["ambiguity_mode"] = ambiguity_mode
-    if "use_dynamic_targets" not in x_kwargs and exit_name == "morning_leader":
+    if "use_dynamic_targets" not in x_kwargs and exit_name in ("morning_leader", "dynamic_leader"):
         x_kwargs["use_dynamic_targets"] = exit_flag
 
     scanner = SCANNERS[scanner_name](**s_kwargs)

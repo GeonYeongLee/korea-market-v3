@@ -141,7 +141,8 @@ class MorningLeaderExit(IExitPolicy):
 
         # Super Leader holding mode
         if position.metadata.get("is_super_leader", False):
-            if bar is not None and position.entry_dt is not None and bar.dt > position.entry_dt:
+            ref_dt = (position.metadata.get("ref_bar") or {}).get("dt") or position.entry_dt
+            if bar is not None and ref_dt is not None and bar.dt > ref_dt:
                 step_up_bars = position.metadata.get("step_up_bars_held", 0)
                 if step_up_bars >= self.step_up_holding_bars:
                     return self._make_signal(position, current_dt, bar.close, "SMART_STEP_UP_MATURED_EXIT")
@@ -221,7 +222,8 @@ class MorningLeaderExit(IExitPolicy):
             return sig
 
         # 2. Phase 1 -> Phase 2 Transition (Bar 1+) & Holding Bar Tracker
-        is_subsequent = bar is not None and position.entry_dt is not None and bar.dt > position.entry_dt
+        ref_dt = (position.metadata.get("ref_bar") or {}).get("dt") or position.entry_dt
+        is_subsequent = bar is not None and ref_dt is not None and bar.dt > ref_dt
         if is_subsequent:
             last_dt = position.metadata.get("last_bar_dt")
             if bar.dt != last_dt:

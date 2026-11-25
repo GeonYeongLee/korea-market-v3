@@ -54,6 +54,7 @@ class DynamicLeaderExit(MorningLeaderExit):
         volume_cliff_enabled: bool = False,      # Volume cliff early exit toggle
         hard_timeout: time = time(15, 21),       # 15:21 Hard timeout liquidation
         ambiguity_mode: str = "pessimistic",     # "pessimistic" (SL first) or "optimistic"
+        use_dynamic_targets: bool = True,        # ATR-based dynamic TP/SL parameterization
     ):
         super().__init__(
             emergency_sl_pct=emergency_sl_pct,
@@ -66,6 +67,7 @@ class DynamicLeaderExit(MorningLeaderExit):
             volume_cliff_enabled=volume_cliff_enabled,
             hard_timeout=hard_timeout,
             ambiguity_mode=ambiguity_mode,
+            use_dynamic_targets=use_dynamic_targets,
         )
         self.trailing_buffer_pct = trailing_buffer_pct
         self.trend_extension = trend_extension
@@ -94,8 +96,9 @@ class DynamicLeaderExit(MorningLeaderExit):
             side="SELL",
             round_mode="floor",
         )
+        eff_step_up_pct = position.metadata.get("step_up_pct", self.step_up_pct)
         min_floor = round_to_krx_tick(
-            position.avg_price * (1.0 + self.step_up_pct),
+            position.avg_price * (1.0 + eff_step_up_pct),
             side="SELL",
             round_mode="floor",
         )
@@ -112,8 +115,9 @@ class DynamicLeaderExit(MorningLeaderExit):
         """Evaluates smart step-up take profit and dynamic leader holding / ratchet conditions."""
         tp_price = position.take_profit_price
         if tp_price <= 0.0:
+            eff_tp_pct = position.metadata.get("tp_target_pct", self.tp_target_pct)
             tp_price = round_to_krx_tick(
-                position.avg_price * (1.0 + self.tp_target_pct),
+                position.avg_price * (1.0 + eff_tp_pct),
                 side="SELL",
                 round_mode="ceil",
             )
@@ -179,8 +183,9 @@ class DynamicLeaderExit(MorningLeaderExit):
 
             # Candle close evaluation in bar mode
             if bar is not None:
+                eff_step_up_pct = position.metadata.get("step_up_pct", self.step_up_pct)
                 step2_price = round_to_krx_tick(
-                    position.avg_price * (1.0 + self.step_up_pct),
+                    position.avg_price * (1.0 + eff_step_up_pct),
                     side="SELL",
                     round_mode="ceil",
                 )
