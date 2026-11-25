@@ -192,6 +192,8 @@ class DailyRoutineOrchestrator:
         # 09:00:01 스캐너 가동 및 틱 수신 전에 전략 라이프사이클 명시적 호출
         self.strategy.on_day_open(engine.context, target_date_obj)
         engine._current_date = target_date_obj
+        cutoff_t = getattr(self.strategy, "cutoff_time", dtime(9, 25, 0))
+        cutoff_str = cutoff_t.strftime("%H:%M")
 
         max_slots = self.strategy.max_daily_positions
         slot_notional = getattr(self.strategy, "current_slot_notional", 0.0)
