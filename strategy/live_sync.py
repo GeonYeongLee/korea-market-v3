@@ -95,12 +95,14 @@ def register_symbol_minute_bars(
                 (start_t <= b.time <= end_t) and b.open > 0.0 and ((b.high - b.open) / b.open >= min_body) and (b.cum_turnover >= eff_to)
                 for b in bars
             )
-            # Mid-minute ongoing snapshot fallback (REST doesn't yet contain the forming current minute)
+            # Mid-minute ongoing snapshot fallback (must be in [start_t, end_t] & single-bar surge >= min_body)
             snap_px = max(current_price, day_high)
             latest_to = max([b.cum_turnover for b in bars] + [cum_turnover])
             mae = ((eff_low - first_open) / first_open) if first_open > 0.0 else 0.0
             mae_ok = (max_mae is None) or (math.isfinite(mae) and mae >= max_mae)
-            snap_ok = (first_open > 0.0 and snap_px > 0.0 and ((snap_px - first_open) / first_open >= min_body) and latest_to >= eff_to)
+            forming_base = bars[-1].close if (bars and bars[-1].close > 0.0) else first_open
+            in_win = (start_t <= bars[-1].time <= end_t) if bars else (start_t <= datetime.now().time() <= end_t)
+            snap_ok = in_win and (forming_base > 0.0 and snap_px > 0.0 and ((snap_px - forming_base) / forming_base >= min_body) and latest_to >= eff_to)
 
             if mae_ok and (same_bar_ok or snap_ok):
                 if hasattr(sc_target, "_qualified_symbols"):
@@ -113,13 +115,21 @@ def register_symbol_minute_bars(
     return newly_qualified
 
 
-def sync_completed_entry_bar(position: Any, bar: MinuteBar) -> None:
-    """Replaces in-flight entry forming_bar ref with the completed 1-minute bar at minute close."""
+def sync_completed_entry_bar(strategy: Any, position: Any, bar: MinuteBar) -> None:
+    """Replaces in-flight forming_bar ref with completed Bar 0 OHLCV and elevates to Phase 2."""
+    from core.krx_ticks import round_to_krx_tick
+
     prior_atr = position.metadata.get("prior_atr20_pct")
     position.metadata["ref_bar"] = {
         "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close,
         "dt": bar.dt, "turnover": bar.turnover, "volume": bar.volume, "prior_atr20_pct": prior_atr,
     }
+    if getattr(position, "phase", 1) == 1:
+        position.phase = 2
+        eff_sl = abs(position.metadata.get("emergency_sl_pct", getattr(strategy.exit_policy, "emergency_sl_pct", -0.020)))
+        floor_sl = round_to_krx_tick(position.avg_price * (1.0 - eff_sl), side="SELL", round_mode="ceil")
+        center_sl = round_to_krx_tick((bar.open + bar.close) / 2.0, side="SELL", round_mode="ceil")
+        position.stop_loss_price = max(position.stop_loss_price, center_sl, floor_sl)
 
 
 def update_forming_bar(forming_bars: Dict[str, MinuteBar], tick: TickData, mid_promoted: Optional[set] = None) -> MinuteBar:
@@ -225,11 +235,15 @@ def submit_entry_order(strategy: Any, context: Any, symbol: str, ref_bar: Minute
     strategy._active_positions.add(symbol)
     strategy._active_candidates.discard(symbol)
     pos = context.get_position(symbol)
+    broker_pending = False
+    broker = getattr(context, "broker", None)
+    if broker and hasattr(broker, "get_pending_orders"):
+        broker_pending = any(o.symbol == symbol for o in broker.get_pending_orders())
     if pos:
         pos.metadata.setdefault("ref_bar", ref_dict)
         if prior_atr is not None:
             pos.metadata.setdefault("prior_atr20_pct", prior_atr)
-    else:
+    if not pos or broker_pending:
         strategy._pending_buy_symbols.add(symbol)
 
 

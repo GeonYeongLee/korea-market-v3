@@ -195,6 +195,17 @@ class DailyRoutineOrchestrator:
         cutoff_t = getattr(self.strategy, "cutoff_time", dtime(9, 25, 0))
         cutoff_str = cutoff_t.strftime("%H:%M")
 
+        dyn_p = getattr(self.strategy, "dynamic_feature_provider", None)
+        latest_settled = getattr(dyn_p, "_latest_settled_stock_date", None) if dyn_p else None
+        if isinstance(latest_settled, str) and len(latest_settled) == 10:
+            try:
+                stale_days = (target_date_obj - date.fromisoformat(latest_settled)).days
+                if stale_days > 4:
+                    logger.warning(f"Daily feature parquet stale ({latest_settled} vs {target_date_obj}, {stale_days}d gap). Run dataset refresh before live session.")
+                    console.print(f"[bold yellow]⚠️ [DATA FRESHNESS] daily_bars_2y.parquet 최종 정산일({latest_settled})이 {stale_days}일 경과했습니다. 전일 데이터 갱신을 권장합니다.[/bold yellow]")
+            except Exception:
+                pass
+
         max_slots = self.strategy.max_daily_positions
         slot_notional = getattr(self.strategy, "current_slot_notional", 0.0)
 

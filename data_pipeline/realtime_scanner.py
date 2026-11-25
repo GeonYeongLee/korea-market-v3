@@ -162,6 +162,7 @@ class RealtimeLeaderScanner:
         self._promoted_symbols: Set[str] = set()
         self._mae_blacklisted: Set[str] = set()
         self._price_cache: Dict[str, Dict[str, float]] = {}
+        self._vr_price_cache_ts: Dict[str, float] = {}
         self._last_snapshot_minute: Optional[str] = None
         self._last_gain_pool: Dict[str, tuple[float, Dict[str, Any]]] = {}
         self._callbacks: List[Callable[[str, Dict[str, Any]], None]] = []
@@ -192,6 +193,7 @@ class RealtimeLeaderScanner:
         self._promoted_symbols.clear()
         self._mae_blacklisted.clear()
         self._price_cache.clear()
+        self._vr_price_cache_ts.clear()
         self._last_snapshot_minute = None
         self._last_gain_pool.clear()
         logger.info("[RealtimeLeaderScanner] Daily state reset complete for new trading session.")
@@ -441,6 +443,7 @@ class RealtimeLeaderScanner:
                         if rank_items:
                             existing_codes = {str(it.get("code", "")).strip() for it in items}
                             un_added = 0
+                            enrich_calls = 0
                             for r in rank_items:  # Filter ETF/ETN/SPAC BEFORE slicing top 30 UN leaders
                                 if un_added >= 30:
                                     break
@@ -456,15 +459,28 @@ class RealtimeLeaderScanner:
                                             day_lo = str(r.get("stck_lwpr", "0") or "0")
                                             prev_cl = str(r.get("stck_prdy_clpr", "0") or "0")
                                             chgr = str(r.get("prdy_ctrt", "0") or "0")
-                                            if (float(day_op) <= 0.0 or float(day_lo) <= 0.0) and r_code not in self._discovered_symbols and hasattr(self.client, "get_current_price"):
-                                                cp_info = self.client.get_current_price(r_code, market_div="UN")
-                                                if isinstance(cp_info, dict) and cp_info:
-                                                    day_op = str(cp_info.get("stck_oprc") or day_op)
-                                                    day_hi = str(cp_info.get("stck_hgpr") or day_hi)
-                                                    day_lo = str(cp_info.get("stck_lwpr") or day_lo)
-                                                    prev_cl = str(cp_info.get("stck_prdy_clpr") or prev_cl)
-                                                    stck_prpr = str(cp_info.get("stck_prpr") or stck_prpr)
-                                                    chgr = str(cp_info.get("prdy_ctrt") or chgr)
+                                            if (float(day_op) <= 0.0 or float(day_lo) <= 0.0) and r_code not in self._discovered_symbols:
+                                                cached = self._price_cache.get(r_code)
+                                                last_ts = self._vr_price_cache_ts.get(r_code, 0.0)
+                                                if cached and (now_sec - last_ts) < 12.0 and cached.get("day_open", 0.0) > 0.0:
+                                                    day_op = str(cached["day_open"])
+                                                    day_hi = str(cached.get("day_high") or cached["day_open"])
+                                                    day_lo = str(cached.get("day_low") or cached["day_open"])
+                                                    prev_cl = str(cached.get("prev_close") or prev_cl)
+                                                elif enrich_calls < 10 and hasattr(self.client, "get_current_price"):
+                                                    try:
+                                                        cp_info = self.client.get_current_price(r_code, market_div="UN")
+                                                        enrich_calls += 1
+                                                        self._vr_price_cache_ts[r_code] = now_sec
+                                                        if isinstance(cp_info, dict) and cp_info:
+                                                            day_op = str(cp_info.get("stck_oprc") or day_op)
+                                                            day_hi = str(cp_info.get("stck_hgpr") or day_hi)
+                                                            day_lo = str(cp_info.get("stck_lwpr") or day_lo)
+                                                            prev_cl = str(cp_info.get("stck_prdy_clpr") or prev_cl)
+                                                            stck_prpr = str(cp_info.get("stck_prpr") or stck_prpr)
+                                                            chgr = str(cp_info.get("prdy_ctrt") or chgr)
+                                                    except Exception as cp_err:
+                                                        logger.debug(f"UN price enrichment failed for {r_code}: {cp_err}")
                                             tot_to = float(r.get("_tot_to", 0.0) or r.get("acml_tr_pbmn", 0.0) or 0.0)
                                             norm_item = {
                                                 "code": r_code,

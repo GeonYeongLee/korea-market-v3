@@ -356,44 +356,55 @@ class KisLiveBroker(IBroker):
                 if order.order_id in self._pending_orders:
                     return order.order_id
 
+                pending_fill_event: Optional[OrderEvent] = None
                 with self._lock:
                     early = self._early_executions.pop(odno, None) if odno else None
                     if early is not None:
                         early_qty = int(early.get("qty", 0)) if isinstance(early, dict) else int(order.quantity)
                         early_px = float(early.get("notice", {}).get("price", 0.0) or order.price or 0.0) if isinstance(early, dict) else float(order.price or 0.0)
+                        emitted_filled = bool(early.get("emitted_filled", True)) if isinstance(early, dict) else True
                         if early_qty >= order.quantity:
                             order.unfilled_quantity = 0
                             order.status = OrderStatus.FILLED
                             logger.info(
                                 f"[{self.mode.upper()}] Order {odno} matched early execution notice ({early_qty}/{order.quantity}); marked FILLED immediately."
                             )
-                            self._emit_event(OrderEvent(
-                                order_id=order.order_id,
-                                symbol=order.symbol,
-                                side=order.side,
-                                status=OrderStatus.FILLED,
-                                filled_price=early_px,
-                                filled_quantity=early_qty,
-                                dt=datetime.now(),
-                                message=f"Early execution reconciled ({early_qty}/{order.quantity})",
-                            ))
-                            return order.order_id
-                        order.unfilled_quantity = max(0, order.quantity - early_qty)
-                        order.status = OrderStatus.PARTIALLY_FILLED
+                            if not emitted_filled:
+                                pending_fill_event = OrderEvent(
+                                    order_id=order.order_id,
+                                    symbol=order.symbol,
+                                    side=order.side,
+                                    status=OrderStatus.FILLED,
+                                    filled_price=early_px,
+                                    filled_quantity=early_qty,
+                                    dt=datetime.now(),
+                                    message=f"Early execution reconciled ({early_qty}/{order.quantity})",
+                                )
+                        else:
+                            order.unfilled_quantity = max(0, order.quantity - early_qty)
+                            order.status = OrderStatus.PARTIALLY_FILLED
+                            if order.created_at is None:
+                                order.created_at = datetime.now()
+                            self._pending_orders[order.order_id] = order
+                            self._order_submit_time[order.order_id] = time.time()
+                            logger.info(
+                                f"[{self.mode.upper()}] Order {odno} matched early partial execution ({early_qty}/{order.quantity}); tracking remaining {order.unfilled_quantity}."
+                            )
+                        early_done = True
+                    else:
+                        early_done = False
+
+                    if not early_done:
+                        order.status = OrderStatus.PENDING
                         if order.created_at is None:
                             order.created_at = datetime.now()
                         self._pending_orders[order.order_id] = order
                         self._order_submit_time[order.order_id] = time.time()
-                        logger.info(
-                            f"[{self.mode.upper()}] Order {odno} matched early partial execution ({early_qty}/{order.quantity}); tracking remaining {order.unfilled_quantity}."
-                        )
-                        return order.order_id
 
-                    order.status = OrderStatus.PENDING
-                    if order.created_at is None:
-                        order.created_at = datetime.now()
-                    self._pending_orders[order.order_id] = order
-                    self._order_submit_time[order.order_id] = time.time()
+                if pending_fill_event is not None:
+                    self._emit_event(pending_fill_event)
+                if early_done:
+                    return order.order_id
 
                 logger.info(
                     f"[{self.mode.upper()}] Order submitted successfully: {order.side.value} {order.quantity} {order.symbol} "
@@ -652,6 +663,8 @@ class KisLiveBroker(IBroker):
                 else:
                     rem_pos = self._positions.get(symbol)
                     is_partial = rem_pos is not None and rem_pos.quantity > 0
+                if order_no and order_no in self._early_executions:
+                    self._early_executions[order_no]["emitted_filled"] = not is_partial
 
         status = OrderStatus.PARTIALLY_FILLED if is_partial else OrderStatus.FILLED
         logger.info(

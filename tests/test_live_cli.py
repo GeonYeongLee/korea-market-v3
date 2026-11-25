@@ -300,12 +300,14 @@ def test_p0_fixes_pending_orders_pre_entry_bar_and_partial_cancel():
     assert ctx.liquidate.call_count == 0
     assert pos.metadata["ref_bar"]["low"] == 49500.0
     assert pos.metadata["ref_bar"]["close"] == 52400.0
+    assert pos.phase == 2
+    assert pos.stop_loss_price >= 51200.0
 
     # Cancelling unfilled remainder of partially filled BUY must NOT decrement _daily_trade_count
     strategy.on_order_event(ctx, OrderEvent(order_id="O2", symbol="999990", side=OrderSide.BUY, status=OrderStatus.CANCELLED, filled_price=0.0, filled_quantity=0, dt=datetime(2026, 11, 16, 9, 3, 25)))
     assert strategy._daily_trade_count == 1
 
-    # 3. VOLUME_RANK_UN missing OHLC enriches via get_current_price(market_div="UN")
+    # 3. VOLUME_RANK_UN missing OHLC enriches via get_current_price(market_div="UN") & caches cooldown
     vr_client = MagicMock()
     vr_client.get_condition_search_result.return_value = []
     vr_client.get_volume_rank.return_value = [{"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "stck_prpr": "52500", "_tot_to": 5_000_000_000.0, "acml_vol": "100000"}]
@@ -316,6 +318,16 @@ def test_p0_fixes_pending_orders_pre_entry_bar_and_partial_cancel():
     promoted = scanner.scan_cycle()
     assert promoted == ["005930"]
     vr_client.get_current_price.assert_called_once_with("005930", market_div="UN")
+
+    # Second unpromoted symbol cached within cooldown does not hammer REST
+    vr_client2 = MagicMock()
+    vr_client2.get_condition_search_result.return_value = []
+    vr_client2.get_volume_rank.return_value = [{"mksc_shrn_iscd": "000660", "hts_kor_isnm": "SK하이닉스", "stck_prpr": "101000", "_tot_to": 5_000_000_000.0, "acml_vol": "100000"}]
+    vr_client2.get_current_price.return_value = {"stck_prpr": "101000", "stck_oprc": "100000", "stck_hgpr": "101500", "stck_lwpr": "99800", "stck_prdy_clpr": "100000", "prdy_ctrt": "1.0"}
+    scanner2 = RealtimeLeaderScanner(client=vr_client2, datafeed=mock_feed, min_gain_pct=3.0, min_turnover_krw=800_000_000.0, max_mae_pct=-2.0, volume_rank_interval_sec=0.0)
+    assert scanner2.scan_cycle() == []
+    assert scanner2.scan_cycle() == []
+    assert vr_client2.get_current_price.call_count == 1
 
 
 

@@ -205,7 +205,7 @@ class CompositeStrategy(BaseStrategy):
                 entry_min = position.entry_dt.replace(second=0, microsecond=0) if position.entry_dt else None
                 if entry_min is not None and bar_min <= entry_min:
                     if bar_min == entry_min:
-                        live_sync.sync_completed_entry_bar(position, bar)
+                        live_sync.sync_completed_entry_bar(self, position, bar)
                     return
                 if bar.symbol not in self._pending_sell_symbols:
                     sig = self.exit_policy.evaluate_exit(position, bar)
