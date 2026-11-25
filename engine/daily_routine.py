@@ -195,8 +195,7 @@ class DailyRoutineOrchestrator:
         cutoff_t = getattr(self.strategy, "cutoff_time", dtime(9, 25, 0))
         cutoff_str = cutoff_t.strftime("%H:%M")
 
-        dyn_p = getattr(self.strategy, "dynamic_feature_provider", None)
-        latest_settled = getattr(dyn_p, "_latest_settled_stock_date", None) if dyn_p else None
+        latest_settled = getattr(dyn_provider, "_latest_settled_stock_date", None)
         if isinstance(latest_settled, str) and len(latest_settled) == 10:
             try:
                 stale_days = (target_date_obj - date.fromisoformat(latest_settled)).days
