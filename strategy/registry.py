@@ -156,8 +156,6 @@ def build_strategy(
         x_kwargs["bull_kwargs"] = unified_x
     if "use_dynamic_targets" not in x_kwargs and exit_name == "morning_leader":
         x_kwargs["use_dynamic_targets"] = exit_flag
-    if "use_dynamic_targets" not in x_kwargs and exit_name == "morning_leader":
-        x_kwargs["use_dynamic_targets"] = exit_flag
 
     scanner = SCANNERS[scanner_name](**s_kwargs)
     entry = ENTRIES[entry_name](**e_kwargs)

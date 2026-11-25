@@ -243,6 +243,8 @@ class RealtimeLeaderScanner:
                     if self.strategy and isinstance(getattr(self.strategy, "_active_candidates", None), set) and hasattr(self.strategy, "register_symbol_minute_bars"):
                         self.strategy.register_symbol_minute_bars(
                             symbol, parsed_bars, day_open=day_o, day_low=day_l,
+                            day_high=float(item.get("day_high", 0.0) or item.get("high", 0.0) or 0.0),
+                            current_price=float(item.get("current_price", 0.0) or item.get("price", 0.0) or 0.0),
                             cum_turnover=to_krw, prev_close=prev_c, is_promoted=True,
                         )
                     elif self.strategy and hasattr(self.strategy, "scanner") and hasattr(self.strategy.scanner, "on_bar"):
@@ -449,18 +451,32 @@ class RealtimeLeaderScanner:
                                     if r_code not in existing_codes:
                                         stck_prpr = str(r.get("stck_prpr", "0") or "0")
                                         if float(stck_prpr or 0.0) > 0:
+                                            day_op = str(r.get("stck_oprc", "0") or "0")
+                                            day_hi = str(r.get("stck_hgpr", "0") or "0")
+                                            day_lo = str(r.get("stck_lwpr", "0") or "0")
+                                            prev_cl = str(r.get("stck_prdy_clpr", "0") or "0")
+                                            chgr = str(r.get("prdy_ctrt", "0") or "0")
+                                            if (float(day_op) <= 0.0 or float(day_lo) <= 0.0) and r_code not in self._discovered_symbols and hasattr(self.client, "get_current_price"):
+                                                cp_info = self.client.get_current_price(r_code, market_div="UN")
+                                                if isinstance(cp_info, dict) and cp_info:
+                                                    day_op = str(cp_info.get("stck_oprc") or day_op)
+                                                    day_hi = str(cp_info.get("stck_hgpr") or day_hi)
+                                                    day_lo = str(cp_info.get("stck_lwpr") or day_lo)
+                                                    prev_cl = str(cp_info.get("stck_prdy_clpr") or prev_cl)
+                                                    stck_prpr = str(cp_info.get("stck_prpr") or stck_prpr)
+                                                    chgr = str(cp_info.get("prdy_ctrt") or chgr)
                                             tot_to = float(r.get("_tot_to", 0.0) or r.get("acml_tr_pbmn", 0.0) or 0.0)
                                             norm_item = {
                                                 "code": r_code,
                                                 "name": r_name,
                                                 "price": stck_prpr,
-                                                "open": str(r.get("stck_oprc", "0") or "0"),
-                                                "high": str(r.get("stck_hgpr", "0") or "0"),
-                                                "low": str(r.get("stck_lwpr", "0") or "0"),
+                                                "open": day_op,
+                                                "high": day_hi,
+                                                "low": day_lo,
                                                 "trade_amt": str(tot_to / 1000.0),
                                                 "acml_vol": str(r.get("acml_vol", "0") or "0"),
-                                                "chgrate": str(r.get("prdy_ctrt", "0") or "0"),
-                                                "prev_close": str(r.get("stck_prdy_clpr", "0") or "0"),
+                                                "chgrate": chgr,
+                                                "prev_close": prev_cl,
                                                 "_source": "VOLUME_RANK_UN",
                                             }
                                             items.append(norm_item)
@@ -488,7 +504,7 @@ class RealtimeLeaderScanner:
                 vol = int(float(it.get("acml_vol", 0.0) or 0.0))
                 chgrate = float(it.get("chgrate", 0.0) or 0.0)
                 prev_close = float(it.get("prev_close", 0.0) or it.get("stck_prdy_clpr", 0.0) or 0.0)
-                if prev_close <= 0.0 and px > 0.0 and (1.0 + chgrate / 100.0) > 0.0 and chgrate != 0.0:
+                if prev_close <= 0.0 and px > 0.0 and (1.0 + chgrate / 100.0) > 0.0:
                     prev_close = px / (1.0 + chgrate / 100.0)
 
                 open_gain = round(((px - day_o) / day_o) * 100.0, 2) if day_o > 0 else 0.0
@@ -564,8 +580,8 @@ class RealtimeLeaderScanner:
                     )
                     continue
 
-                # Condition 3: Day Low vs Day Open (MAE > max_mae_pct)
-                if mae_pct <= self.max_mae_pct:
+                # Condition 3: Day Low vs Day Open (MAE >= max_mae_pct, strict < consistent with MorningLeaderScanner)
+                if mae_pct < self.max_mae_pct:
                     self._mae_blacklisted.add(code)
                     self._discovered_symbols.add(code)
                     logger.warning(

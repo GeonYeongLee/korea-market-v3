@@ -271,4 +271,51 @@ def test_composite_tick_entry_and_no_duplicate_sell_storm():
     assert ctx.liquidate.call_count == 1
 
 
+def test_p0_fixes_pending_orders_pre_entry_bar_and_partial_cancel():
+    """Verify P0/P1 Round-3 fixes: KisLiveBroker.get_pending_orders, pre-entry bar skip, partial cancel count, UN enrichment."""
+    from engine.models import TickData, Position, MinuteBar, Order, OrderEvent, OrderSide, OrderStatus, OrderType
+    from engine.broker.kis_live import KisLiveBroker
+    from config.settings import Settings
+    from core.rate_limiter import RateLimiter
+    from strategy.registry import build_strategy
+
+    # 1. KisLiveBroker.get_pending_orders exposes pending orders cleanly
+    mock_client = MagicMock()
+    broker = KisLiveBroker(mode="vts", client=mock_client)
+    broker._pending_orders["O1"] = Order(order_id="O1", symbol="005930", side=OrderSide.BUY, order_type=OrderType.LIMIT, quantity=10, price=50000.0)
+    assert len(broker.get_pending_orders()) == 1
+
+    # 2. Mid-minute tick entry + same-minute completed bar skips pre-entry exit & syncs ref_bar; partial cancel keeps slot count
+    strategy = build_strategy(scanner_name="all_weather", entry_name="all_weather", exit_name="all_weather", dynamic=True)
+    ctx = MagicMock()
+    ctx.get_balance.return_value = MagicMock(cash=10_000_000.0)
+    pos = Position(symbol="999990", quantity=40, avg_price=52300.0, current_price=52300.0, high_water_mark=52300.0, entry_dt=datetime(2026, 11, 16, 9, 2, 40), stop_loss_price=51300.0, take_profit_price=54000.0)
+    ctx.get_position.side_effect = lambda sym: pos if sym == "999990" else None
+    strategy.on_day_open(ctx, date(2026, 11, 16))
+    strategy._daily_trade_count = 1
+
+    # Completed 09:02 bar had low=49,500 BEFORE 09:02:40 entry -> must NOT liquidate, must update ref_bar
+    b_same_min = MinuteBar("999990", datetime(2026, 11, 16, 9, 2), 50000.0, 52500.0, 49500.0, 52400.0, 50000, turnover=2.6e9, cum_turnover=2.6e9)
+    strategy.on_bar(ctx, b_same_min)
+    assert ctx.liquidate.call_count == 0
+    assert pos.metadata["ref_bar"]["low"] == 49500.0
+    assert pos.metadata["ref_bar"]["close"] == 52400.0
+
+    # Cancelling unfilled remainder of partially filled BUY must NOT decrement _daily_trade_count
+    strategy.on_order_event(ctx, OrderEvent(order_id="O2", symbol="999990", side=OrderSide.BUY, status=OrderStatus.CANCELLED, filled_price=0.0, filled_quantity=0, dt=datetime(2026, 11, 16, 9, 3, 25)))
+    assert strategy._daily_trade_count == 1
+
+    # 3. VOLUME_RANK_UN missing OHLC enriches via get_current_price(market_div="UN")
+    vr_client = MagicMock()
+    vr_client.get_condition_search_result.return_value = []
+    vr_client.get_volume_rank.return_value = [{"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "stck_prpr": "52500", "_tot_to": 5_000_000_000.0, "acml_vol": "100000"}]
+    vr_client.get_current_price.return_value = {"stck_prpr": "52500", "stck_oprc": "50000", "stck_hgpr": "52800", "stck_lwpr": "49900", "stck_prdy_clpr": "50000", "prdy_ctrt": "5.0"}
+    mock_feed = MagicMock()
+    mock_feed.active_symbols = []
+    scanner = RealtimeLeaderScanner(client=vr_client, datafeed=mock_feed, min_gain_pct=3.0, min_turnover_krw=800_000_000.0, max_mae_pct=-2.0, volume_rank_interval_sec=0.0)
+    promoted = scanner.scan_cycle()
+    assert promoted == ["005930"]
+    vr_client.get_current_price.assert_called_once_with("005930", market_div="UN")
+
+
 

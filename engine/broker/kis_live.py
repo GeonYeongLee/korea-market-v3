@@ -42,6 +42,7 @@ class KisLiveBroker(IBroker):
         self._positions: Dict[str, Position] = {}
         self._pending_orders: Dict[str, Order] = {}
         self._early_executions: Dict[str, Dict[str, Any]] = {}
+        self._inflight_buy_qty: Dict[str, int] = {}
         self._order_submit_time: Dict[str, float] = {}
         self._latest_balance: Optional[AccountBalance] = None
         self._initial_capital: float = 10_000_000.0
@@ -317,13 +318,23 @@ class KisLiveBroker(IBroker):
             order_type_str = "01" if is_market else ("11" if "IOC" in (order.tag or "").upper() else "00")
 
             if order.side == OrderSide.BUY:
-                resp = self.order_cash_buy(
-                    symbol=order.symbol,
-                    qty=int(order.quantity),
-                    price=order_p,
-                    order_type=order_type_str,
-                    order=order,
-                )
+                with self._lock:
+                    self._inflight_buy_qty[order.symbol] = self._inflight_buy_qty.get(order.symbol, 0) + int(order.quantity)
+                try:
+                    resp = self.order_cash_buy(
+                        symbol=order.symbol,
+                        qty=int(order.quantity),
+                        price=order_p,
+                        order_type=order_type_str,
+                        order=order,
+                    )
+                finally:
+                    with self._lock:
+                        rem_in = self._inflight_buy_qty.get(order.symbol, 0) - int(order.quantity)
+                        if rem_in > 0:
+                            self._inflight_buy_qty[order.symbol] = rem_in
+                        else:
+                            self._inflight_buy_qty.pop(order.symbol, None)
             else:
                 resp = self.order_cash_sell(
                     symbol=order.symbol,
@@ -349,12 +360,23 @@ class KisLiveBroker(IBroker):
                     early = self._early_executions.pop(odno, None) if odno else None
                     if early is not None:
                         early_qty = int(early.get("qty", 0)) if isinstance(early, dict) else int(order.quantity)
+                        early_px = float(early.get("notice", {}).get("price", 0.0) or order.price or 0.0) if isinstance(early, dict) else float(order.price or 0.0)
                         if early_qty >= order.quantity:
                             order.unfilled_quantity = 0
                             order.status = OrderStatus.FILLED
                             logger.info(
                                 f"[{self.mode.upper()}] Order {odno} matched early execution notice ({early_qty}/{order.quantity}); marked FILLED immediately."
                             )
+                            self._emit_event(OrderEvent(
+                                order_id=order.order_id,
+                                symbol=order.symbol,
+                                side=order.side,
+                                status=OrderStatus.FILLED,
+                                filled_price=early_px,
+                                filled_quantity=early_qty,
+                                dt=datetime.now(),
+                                message=f"Early execution reconciled ({early_qty}/{order.quantity})",
+                            ))
                             return order.order_id
                         order.unfilled_quantity = max(0, order.quantity - early_qty)
                         order.status = OrderStatus.PARTIALLY_FILLED
@@ -492,6 +514,11 @@ class KisLiveBroker(IBroker):
             ))
             return False
 
+    def get_pending_orders(self) -> List[Order]:
+        """Returns a shallow snapshot of currently open pending orders."""
+        with self._lock:
+            return list(self._pending_orders.values())
+
     def cancel_pending_orders(self, symbol: Optional[str] = None) -> List[str]:
         """Cancels all active pending orders, optionally filtered by symbol."""
         cancelled_ids = []
@@ -617,6 +644,14 @@ class KisLiveBroker(IBroker):
                     self._early_executions[order_no] = {"qty": prev_qty + filled_qty, "notice": notice}
 
             self._apply_position_fill(symbol, filled_qty, filled_p, side)
+            if pend_order is None:
+                cum_early = prev_qty + filled_qty if order_no else filled_qty
+                inflight_qty = self._inflight_buy_qty.get(symbol, 0) if side == OrderSide.BUY else 0
+                if side == OrderSide.BUY:
+                    is_partial = inflight_qty > 0 and cum_early < inflight_qty
+                else:
+                    rem_pos = self._positions.get(symbol)
+                    is_partial = rem_pos is not None and rem_pos.quantity > 0
 
         status = OrderStatus.PARTIALLY_FILLED if is_partial else OrderStatus.FILLED
         logger.info(

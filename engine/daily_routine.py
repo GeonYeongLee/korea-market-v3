@@ -198,12 +198,13 @@ class DailyRoutineOrchestrator:
         max_slots = self.strategy.max_daily_positions
         slot_notional = getattr(self.strategy, "current_slot_notional", 0.0)
 
+        is_unified = getattr(self.strategy, "regime_mode", None) in ("all_weather", "unified")
+        regime_label = "[bold green]UNIFIED REGIME-FREE (전 시장 상시 가동)[/bold green]" if is_unified else ('[bold red]ACTIVE (하락장 감지)[/bold red]' if is_bear else '[green]INACTIVE (정상 시장)[/green]')
         console.print(Panel.fit(
             f"[bold cyan]🧭 [09:00:01 MARKET REGIME 확정][/bold cyan]\n"
             f"• [bold]KOSPI 갭률[/bold]: {ks_gap:+.2f}% | [bold]KOSDAQ 갭률[/bold]: {kq_gap:+.2f}%\n"
             f"• [bold]20MA 괴리율[/bold]: KOSPI {ks_trend:+.2%}, KOSDAQ {kq_trend:+.2%}\n"
-            f"• [bold]하락장 방어(Bear Market)[/bold]: {'[bold red]ACTIVE (하락장 감지)[/bold red]' if is_bear else '[green]INACTIVE (정상 시장)[/green]'}\n"
-            f"• [bold]동적 갭 한도[/bold]: {dynamic_max_gap:.2f}% (지수 20일 변동성: {gap_std:.2f}%)\n"
+            f"• [bold]운용 모드[/bold]: {regime_label}\n"
             f"• [bold]당일 운용 슬롯[/bold]: [bold yellow]{max_slots}슬롯[/bold yellow] ({slot_notional:,.0f}원/슬롯)",
             border_style="magenta" if max_slots == 0 else "cyan",
         ))

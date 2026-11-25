@@ -8,7 +8,6 @@ from typing import Optional, List, Dict, Set, Any
 
 from core.market_regime import MarketRegimeProvider, get_default_market_regime_provider
 from core.dynamic_features import DynamicFeatureProvider, get_default_dynamic_feature_provider
-from core.krx_ticks import round_to_krx_tick
 from engine.models import MinuteBar, TickData, OrderEvent, OrderStatus, OrderSide, Position
 from strategy.base import BaseStrategy, IScanner, IEntryRule, IExitPolicy
 from strategy import live_sync
@@ -47,6 +46,7 @@ class CompositeStrategy(BaseStrategy):
         self._active_positions: Set[str] = set()
         self._pending_buy_symbols: Set[str] = set()
         self._pending_sell_symbols: Set[str] = set()
+        self._mid_minute_promoted: Set[str] = set()
         self._forming_bars: Dict[str, MinuteBar] = {}
         self._daily_trade_count: int = 0
         self._pending_ref_bars: Dict[str, Dict[str, Any]] = {}
@@ -153,6 +153,7 @@ class CompositeStrategy(BaseStrategy):
             self._active_positions.clear()
             self._pending_buy_symbols.clear()
             self._pending_sell_symbols.clear()
+            self._mid_minute_promoted.clear()
             self._forming_bars.clear()
             self._daily_trade_count = 0
             self._pending_ref_bars.clear()
@@ -200,9 +201,17 @@ class CompositeStrategy(BaseStrategy):
         with self._lock:
             position: Optional[Position] = context.get_position(bar.symbol)
             if position and position.quantity > 0:
+                bar_min = bar.dt.replace(second=0, microsecond=0)
+                entry_min = position.entry_dt.replace(second=0, microsecond=0) if position.entry_dt else None
+                if entry_min is not None and bar_min <= entry_min:
+                    if bar_min == entry_min:
+                        live_sync.sync_completed_entry_bar(position, bar)
+                    return
                 if bar.symbol not in self._pending_sell_symbols:
                     sig = self.exit_policy.evaluate_exit(position, bar)
                     if sig:
+                        if bar.symbol in self._pending_buy_symbols and hasattr(getattr(context, "broker", None), "cancel_pending_orders"):
+                            context.broker.cancel_pending_orders(bar.symbol)
                         is_sl = "SL" in sig.reason or "STOP" in sig.reason
                         exec_p = min(bar.open, sig.target_price) if (is_sl and sig.target_price and sig.target_price > 0) else bar.close
                         logger.info(f"🔻 [EXIT SIGNAL] {bar.symbol} Reason: {sig.reason} | Target: {f'{sig.target_price:,.0f}' if sig.target_price else 'N/A'} KRW | Exec: {exec_p:,.0f} KRW")
@@ -233,19 +242,23 @@ class CompositeStrategy(BaseStrategy):
             if position and position.quantity > 0:
                 if tick.symbol not in self._pending_sell_symbols:
                     sig = self.exit_policy.evaluate_exit(position, None, tick=tick)
-                    if sig and context.liquidate(tick.symbol, price=tick.price, tag=sig.reason):
-                        rem = context.get_position(tick.symbol)
-                        if rem and rem.quantity > 0:
-                            self._pending_sell_symbols.add(tick.symbol)
-                        else:
-                            self._active_positions.discard(tick.symbol)
+                    if sig:
+                        if tick.symbol in self._pending_buy_symbols and hasattr(getattr(context, "broker", None), "cancel_pending_orders"):
+                            context.broker.cancel_pending_orders(tick.symbol)
+                        if context.liquidate(tick.symbol, price=tick.price, tag=sig.reason):
+                            rem = context.get_position(tick.symbol)
+                            if rem and rem.quantity > 0:
+                                self._pending_sell_symbols.add(tick.symbol)
+                            else:
+                                self._active_positions.discard(tick.symbol)
                 return
             if self._daily_trade_count >= self.max_daily_positions or self.current_slot_notional <= 0 or tick.symbol in self._pending_buy_symbols:
                 return
-            forming_bar = live_sync.update_forming_bar(self._forming_bars, tick)
+            forming_bar = live_sync.update_forming_bar(self._forming_bars, tick, self._mid_minute_promoted)
             live_sync.try_qualify_tick(self, tick, forming_bar)
             if tick.symbol in self._active_candidates:
-                entry_sig = self.entry.evaluate_entry(tick.symbol, bar=forming_bar, tick=tick, context_state=live_sync.build_entry_ctx(self, forming_bar))
+                eval_bar = None if tick.symbol in self._mid_minute_promoted else forming_bar
+                entry_sig = self.entry.evaluate_entry(tick.symbol, bar=eval_bar, tick=tick, context_state=live_sync.build_entry_ctx(self, forming_bar))
                 if entry_sig:
                     live_sync.submit_entry_order(self, context, tick.symbol, forming_bar, entry_sig)
 
@@ -254,7 +267,9 @@ class CompositeStrategy(BaseStrategy):
             if event.side == OrderSide.BUY:
                 if event.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
                     self._pending_buy_symbols.discard(event.symbol)
-                    if event.filled_quantity == 0:
+                    pos_now = context.get_position(event.symbol)
+                    has_filled = bool(pos_now and pos_now.quantity > 0)
+                    if event.filled_quantity == 0 and not has_filled:
                         self._daily_trade_count = max(0, self._daily_trade_count - 1)
                         self._active_positions.discard(event.symbol)
                         if hasattr(self.entry, "rollback_entered_symbol"):
@@ -266,21 +281,7 @@ class CompositeStrategy(BaseStrategy):
                     self._active_positions.add(event.symbol)
                     position = context.get_position(event.symbol)
                     if position:
-                        ref_bar = self._pending_ref_bars.get(event.symbol)
-                        if ref_bar:
-                            position.metadata.setdefault("ref_bar", ref_bar)
-                            if ref_bar.get("prior_atr20_pct") is not None:
-                                position.metadata.setdefault("prior_atr20_pct", ref_bar["prior_atr20_pct"])
-                        if event.status == OrderStatus.FILLED:
-                            self._pending_ref_bars.pop(event.symbol, None)
-                        if position.stop_loss_price <= 0.0:
-                            self.exit_policy.on_position_opened(position)
-                        else:
-                            eff_sl = position.metadata.get("emergency_sl_pct", position.metadata.get("hard_sl_pct", getattr(self.exit_policy, "emergency_sl_pct", -0.020)))
-                            eff_tp = position.metadata.get("tp_target_pct", position.metadata.get("tp1_pct", getattr(self.exit_policy, "tp_target_pct", 0.030)))
-                            new_sl = round_to_krx_tick(position.avg_price * (1.0 + eff_sl), side="SELL", round_mode="ceil")
-                            position.stop_loss_price = max(position.stop_loss_price, new_sl)
-                            position.take_profit_price = round_to_krx_tick(position.avg_price * (1.0 + eff_tp), side="SELL", round_mode="ceil")
+                        live_sync.handle_buy_fill(self, position, event)
             elif event.side == OrderSide.SELL and event.status in (OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.CANCELLED):
                 self._pending_sell_symbols.discard(event.symbol)
                 if event.status == OrderStatus.FILLED:

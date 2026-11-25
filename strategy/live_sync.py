@@ -51,6 +51,8 @@ def register_symbol_minute_bars(
     bars: List[MinuteBar],
     day_open: float = 0.0,
     day_low: float = 0.0,
+    day_high: float = 0.0,
+    current_price: float = 0.0,
     cum_turnover: float = 0.0,
     prev_close: float = 0.0,
     is_promoted: bool = True,
@@ -59,10 +61,10 @@ def register_symbol_minute_bars(
     if not bars and day_open <= 0.0:
         return []
 
-    first_open = bars[0].open if bars and bars[0].open > 0.0 else day_open
+    first_open = float(day_open) if day_open and day_open > 0.0 else (bars[0].open if bars and bars[0].open > 0.0 else 0.0)
     eff_low = min((b.low for b in bars if b.low > 0.0), default=day_low or first_open)
     if day_low and day_low > 0.0:
-        eff_low = min(eff_low, day_low)
+        eff_low = min(eff_low, day_low) if eff_low > 0.0 else float(day_low)
     register_symbol_day_open(strategy, symbol, first_open, day_low=eff_low, prev_close=prev_close)
 
     newly_qualified: List[str] = []
@@ -73,12 +75,14 @@ def register_symbol_minute_bars(
             strategy._active_candidates.update(cands)
             newly_qualified.extend(cands)
 
-    # Guard against mid-minute WS truncation: if promoted snapshot already satisfies scanner, register candidate
+    # Guard against mid-minute WS truncation: if live snapshot within window satisfies surge, turnover & MAE, register candidate
     if is_promoted and symbol not in strategy._active_candidates and hasattr(scanner, "is_disqualified"):
         if not scanner.is_disqualified(symbol):
             sc_target = getattr(scanner, "active_scanner", scanner)
             min_body = getattr(sc_target, "min_body_pct", 0.035)
             max_mae = getattr(sc_target, "max_mae_pct", -0.012)
+            start_t = getattr(sc_target, "start_time", time(9, 1))
+            end_t = getattr(sc_target, "end_time", time(9, 15))
             eff_to = getattr(sc_target, "min_cum_turnover", 1_000_000_000.0)
             feats = getattr(sc_target, "_day_features", {})
             if getattr(sc_target, "use_dynamic_turnover", False) and symbol in feats:
@@ -86,25 +90,46 @@ def register_symbol_minute_bars(
                 if adto > 0.0:
                     eff_to = float(np.clip(0.08 * adto, 500_000_000.0, 2_500_000_000.0))
 
-            max_bar_surge = max(((b.high - b.open) / b.open for b in bars if b.open > 0.0), default=0.0)
+            # Same-bar condition on completed bars inside [start_t, end_t] (no cross-bar splice)
+            same_bar_ok = any(
+                (start_t <= b.time <= end_t) and b.open > 0.0 and ((b.high - b.open) / b.open >= min_body) and (b.cum_turnover >= eff_to)
+                for b in bars
+            )
+            # Mid-minute ongoing snapshot fallback (REST doesn't yet contain the forming current minute)
+            snap_px = max(current_price, day_high)
             latest_to = max([b.cum_turnover for b in bars] + [cum_turnover])
             mae = ((eff_low - first_open) / first_open) if first_open > 0.0 else 0.0
             mae_ok = (max_mae is None) or (math.isfinite(mae) and mae >= max_mae)
-            if mae_ok and max_bar_surge >= min_body and latest_to >= eff_to:
+            snap_ok = (first_open > 0.0 and snap_px > 0.0 and ((snap_px - first_open) / first_open >= min_body) and latest_to >= eff_to)
+
+            if mae_ok and (same_bar_ok or snap_ok):
                 if hasattr(sc_target, "_qualified_symbols"):
                     sc_target._qualified_symbols.add(symbol)
                 strategy._active_candidates.add(symbol)
+                if not same_bar_ok and hasattr(strategy, "_mid_minute_promoted"):
+                    strategy._mid_minute_promoted.add(symbol)
                 newly_qualified.append(symbol)
 
     return newly_qualified
 
 
-def update_forming_bar(forming_bars: Dict[str, MinuteBar], tick: TickData) -> MinuteBar:
+def sync_completed_entry_bar(position: Any, bar: MinuteBar) -> None:
+    """Replaces in-flight entry forming_bar ref with the completed 1-minute bar at minute close."""
+    prior_atr = position.metadata.get("prior_atr20_pct")
+    position.metadata["ref_bar"] = {
+        "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close,
+        "dt": bar.dt, "turnover": bar.turnover, "volume": bar.volume, "prior_atr20_pct": prior_atr,
+    }
+
+
+def update_forming_bar(forming_bars: Dict[str, MinuteBar], tick: TickData, mid_promoted: Optional[set] = None) -> MinuteBar:
     """Maintains an up-to-date intra-minute forming bar from live ticks."""
     sym = tick.symbol
     floor_dt = tick.dt.replace(second=0, microsecond=0)
     prev = forming_bars.get(sym)
     if prev is None or prev.dt != floor_dt:
+        if prev is not None and prev.dt != floor_dt and mid_promoted is not None:
+            mid_promoted.discard(sym)
         bar = MinuteBar(
             symbol=sym,
             dt=floor_dt,
@@ -206,4 +231,27 @@ def submit_entry_order(strategy: Any, context: Any, symbol: str, ref_bar: Minute
             pos.metadata.setdefault("prior_atr20_pct", prior_atr)
     else:
         strategy._pending_buy_symbols.add(symbol)
+
+
+def handle_buy_fill(strategy: Any, position: Any, event: Any) -> None:
+    """Attaches Bar 0 reference metadata and initializes/ratchets position SL/TP without downward regression."""
+    from core.krx_ticks import round_to_krx_tick
+    from engine.models import OrderStatus
+
+    ref_bar = strategy._pending_ref_bars.get(event.symbol)
+    if ref_bar:
+        position.metadata.setdefault("ref_bar", ref_bar)
+        if ref_bar.get("prior_atr20_pct") is not None:
+            position.metadata.setdefault("prior_atr20_pct", ref_bar["prior_atr20_pct"])
+    if event.status == OrderStatus.FILLED:
+        strategy._pending_ref_bars.pop(event.symbol, None)
+    if position.stop_loss_price <= 0.0:
+        strategy.exit_policy.on_position_opened(position)
+    else:
+        eff_sl = position.metadata.get("emergency_sl_pct", position.metadata.get("hard_sl_pct", getattr(strategy.exit_policy, "emergency_sl_pct", -0.020)))
+        eff_tp = position.metadata.get("tp_target_pct", position.metadata.get("tp1_pct", getattr(strategy.exit_policy, "tp_target_pct", 0.030)))
+        new_sl = round_to_krx_tick(position.avg_price * (1.0 + eff_sl), side="SELL", round_mode="ceil")
+        position.stop_loss_price = max(position.stop_loss_price, new_sl)
+        position.take_profit_price = round_to_krx_tick(position.avg_price * (1.0 + eff_tp), side="SELL", round_mode="ceil")
+
 
