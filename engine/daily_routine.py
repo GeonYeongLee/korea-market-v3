@@ -137,6 +137,14 @@ class DailyRoutineOrchestrator:
         except Exception as e:
             logger.debug(f"Could not pre-load KRX symbol map: {e}")
 
+        # Pre-warm only the recent rolling window of dynamic features BEFORE waiting for 09:00 open
+        try:
+            from core.dynamic_features import get_default_dynamic_feature_provider
+            dyn_prewarm = getattr(self.strategy, "dynamic_feature_provider", None) or get_default_dynamic_feature_provider()
+            dyn_prewarm.load(live_only=True)
+        except Exception as e:
+            logger.debug(f"Could not pre-load live dynamic features: {e}")
+
         now = datetime.now()
         market_open_time = dtime(9, 0, 0)
         if wait_for_market_open and now.time() < market_open_time:

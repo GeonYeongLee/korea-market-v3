@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
 import numpy as np
@@ -60,6 +60,7 @@ class DynamicFeatureProvider:
         self._latest_settled_features: Dict[str, SymbolDynamicFeatures] = {}
         self._latest_index_date: Optional[str] = None
         self._is_loaded: bool = False
+        self._loaded_live_only: bool = False
 
     @staticmethod
     def _to_date_str(d: object) -> str:
@@ -70,23 +71,61 @@ class DynamicFeatureProvider:
             return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
         return s[:10]
 
-    def load(self) -> None:
-        """Precomputes and caches all dynamic features with strict shift(1) lookahead guard."""
-        if self._is_loaded:
-            return
+    def load(self, live_only: bool = False, lookback_days: int = 60) -> None:
+        """Precomputes dynamic features with strict shift(1) lookahead guard.
 
-        self._load_stock_features()
-        self._load_index_features()
+        When live_only=True, only reads a trailing lookback window and computes
+        _latest_settled_features without iterating thousands of historical dates.
+        """
+        if self._is_loaded:
+            if live_only or not self._loaded_live_only:
+                return
+            # Upgrade from live_only cache to full historical cache if requested
+            self._stock_features_by_date.clear()
+            self._index_features_by_date.clear()
+            self._sorted_stock_dates.clear()
+
+        self._load_stock_features(live_only=live_only, lookback_days=lookback_days)
+        if not live_only:
+            self._load_index_features()
+        self._loaded_live_only = live_only
         self._is_loaded = True
 
-    def _load_stock_features(self) -> None:
+    def _read_recent_daily_parquet(self, cols: list[str], lookback_days: int) -> pd.DataFrame:
+        """Reads only the trailing `lookback_days` window via pyarrow predicate pushdown."""
+        try:
+            import pyarrow.dataset as ds
+            import pyarrow.types as patypes
+
+            dataset = ds.dataset(self.daily_file, format="parquet")
+            date_type = dataset.schema.field("date").type
+            cutoff_date = (datetime.now() - timedelta(days=lookback_days)).date()
+
+            if patypes.is_date(date_type):
+                filt = ds.field("date") >= cutoff_date
+            elif patypes.is_timestamp(date_type):
+                filt = ds.field("date") >= pd.Timestamp(cutoff_date)
+            else:
+                filt = ds.field("date") >= cutoff_date.isoformat()
+
+            df = dataset.to_table(columns=cols, filter=filt).to_pandas()
+            if not df.empty:
+                return df
+        except Exception as e:
+            logger.debug(f"Predicate pushdown fallback to full read for {self.daily_file}: {e}")
+        return pd.read_parquet(self.daily_file, columns=cols)
+
+    def _load_stock_features(self, live_only: bool = False, lookback_days: int = 60) -> None:
         if not os.path.exists(self.daily_file):
             logger.warning(f"Daily file not found: {self.daily_file}")
             return
 
         try:
             cols = ["date", "symbol", "high", "low", "close", "prev_close", "turnover", "adto20"]
-            df = pd.read_parquet(self.daily_file, columns=cols)
+            if live_only:
+                df = self._read_recent_daily_parquet(cols=cols, lookback_days=lookback_days)
+            else:
+                df = pd.read_parquet(self.daily_file, columns=cols)
             df["date_str"] = df["date"].map(self._to_date_str)
             df = df.sort_values(["symbol", "date_str"]).reset_index(drop=True)
 
@@ -98,13 +137,23 @@ class DynamicFeatureProvider:
             # Groupby rolling 20 days
             g = df.groupby("symbol", sort=False)
             df["atr20"] = g["tr"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
-            # Strict Lookahead 0%: shift(1) relative to day t
-            prior_atr = g["atr20"].shift(1)
-            prior_close = g["close"].shift(1)
-            df["prior_atr20_pct"] = (prior_atr / prior_close).replace([np.inf, -np.inf], np.nan)
-            df["prior_adto20"] = g["adto20"].shift(1)
 
-            clean = df.dropna(subset=["prior_atr20_pct", "prior_adto20"])
+            if live_only:
+                # Populate at most the latest 2 trading dates for same-day T parity, skipping 50-year history iteration
+                prior_atr = g["atr20"].shift(1)
+                prior_close = g["close"].shift(1)
+                df["prior_atr20_pct"] = (prior_atr / prior_close).replace([np.inf, -np.inf], np.nan)
+                df["prior_adto20"] = g["adto20"].shift(1)
+                recent_dates = sorted(df["date_str"].unique())[-2:]
+                clean = df[df["date_str"].isin(recent_dates)].dropna(subset=["prior_atr20_pct", "prior_adto20"])
+            else:
+                # Strict Lookahead 0%: shift(1) relative to day t
+                prior_atr = g["atr20"].shift(1)
+                prior_close = g["close"].shift(1)
+                df["prior_atr20_pct"] = (prior_atr / prior_close).replace([np.inf, -np.inf], np.nan)
+                df["prior_adto20"] = g["adto20"].shift(1)
+                clean = df.dropna(subset=["prior_atr20_pct", "prior_adto20"])
+
             for d_str, sub in clean.groupby("date_str", sort=False):
                 syms = sub["symbol"].values
                 atrs = sub["prior_atr20_pct"].values
@@ -139,7 +188,8 @@ class DynamicFeatureProvider:
                 self._latest_settled_stock_date = None
 
             logger.info(
-                f"Loaded stock dynamic features for {len(self._stock_features_by_date)} trading dates. "
+                f"Loaded stock dynamic features ({'live_only' if live_only else 'full'}) for "
+                f"{len(self._stock_features_by_date)} trading dates. "
                 f"Latest settled EOD date: {self._latest_settled_stock_date} ({len(self._latest_settled_features)} symbols)."
             )
         except Exception as e:
@@ -152,10 +202,13 @@ class DynamicFeatureProvider:
 
         try:
             df_idx = pd.read_parquet(self.index_file)
-            required_cols = {"date", "ks_close", "ks_ma20", "kq_close", "kq_ma20", "ks_gap_pct"}
-            if not required_cols.issubset(df_idx.columns):
+            raw_cols = {"date", "ks_close", "ks_ma20", "kq_close", "kq_ma20", "ks_gap_pct"}
+            precomputed_cols = {"date", "ks_trend", "kq_trend", "market_gap_std20", "is_bear_market"}
+            has_raw = raw_cols.issubset(df_idx.columns)
+            has_precomputed = precomputed_cols.issubset(df_idx.columns)
+            if not has_raw and not has_precomputed:
                 logger.warning(
-                    f"Index file {self.index_file} missing required columns: {required_cols - set(df_idx.columns)}"
+                    f"Index file {self.index_file} missing required columns: {raw_cols - set(df_idx.columns)}"
                 )
                 return
 
@@ -164,27 +217,36 @@ class DynamicFeatureProvider:
             if df_idx.empty:
                 return
 
-            # Trend as of day t-1
-            ks_trend = ((df_idx["ks_close"] - df_idx["ks_ma20"]) / df_idx["ks_ma20"]).shift(1)
-            kq_trend = ((df_idx["kq_close"] - df_idx["kq_ma20"]) / df_idx["kq_ma20"]).shift(1)
+            if has_raw:
+                # Trend as of day t-1
+                ks_trend = ((df_idx["ks_close"] - df_idx["ks_ma20"]) / df_idx["ks_ma20"]).shift(1)
+                kq_trend = ((df_idx["kq_close"] - df_idx["kq_ma20"]) / df_idx["kq_ma20"]).shift(1)
 
-            # Gap standard deviation (in % points) over 20 rolling days as of day t-1
-            gap_std = (
-                df_idx["ks_gap_pct"].shift(1).rolling(20, min_periods=5).std().fillna(DEFAULT_MARKET_GAP_STD)
-            )
+                # Gap standard deviation (in % points) over 20 rolling days as of day t-1
+                gap_std = (
+                    df_idx["ks_gap_pct"].shift(1).rolling(20, min_periods=5).std().fillna(DEFAULT_MARKET_GAP_STD)
+                )
+                bear_series = None
+            else:
+                ks_trend = df_idx["ks_trend"]
+                kq_trend = df_idx["kq_trend"]
+                gap_std = df_idx["market_gap_std20"]
+                bear_series = df_idx["is_bear_market"]
 
-            for _, row in df_idx.iterrows():
-                d_str = row["date_str"]
-                kt = ks_trend.loc[row.name]
-                qt = kq_trend.loc[row.name]
-                gs = gap_std.loc[row.name]
+            for idx_pos, d_str in enumerate(df_idx["date_str"].values):
+                kt = ks_trend.iloc[idx_pos]
+                qt = kq_trend.iloc[idx_pos]
+                gs = gap_std.iloc[idx_pos]
 
                 eff_kt = float(kt) if pd.notna(kt) else 0.0
                 eff_qt = float(qt) if pd.notna(qt) else 0.0
                 eff_gs = float(gs) if pd.notna(gs) and gs > 0 else DEFAULT_MARKET_GAP_STD
 
-                # Bear Market Defense: Both KOSPI and KOSDAQ below MA20 on t-1
-                is_bear = (eff_kt < 0.0) and (eff_qt < 0.0)
+                if bear_series is not None and pd.notna(bear_series.iloc[idx_pos]):
+                    is_bear = bool(bear_series.iloc[idx_pos])
+                else:
+                    # Bear Market Defense: Both KOSPI and KOSDAQ below MA20 on t-1
+                    is_bear = (eff_kt < 0.0) and (eff_qt < 0.0)
 
                 # Dynamic Max Gap: clip(1.0 * std, 0.50%, 1.75%)
                 dyn_gap = float(np.clip(1.0 * eff_gs, 0.50, 1.75))

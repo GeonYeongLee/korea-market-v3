@@ -82,9 +82,19 @@ class KISRestClient:
                 else:
                     resp = self.session.get(url, headers=headers, params=params, timeout=timeout)
                 status_code = getattr(resp, "status_code", 0)
+                try:
+                    data = resp.json() if hasattr(resp, "json") else {}
+                    if isinstance(data, dict):
+                        rt_cd = str(data.get("rt_cd", ""))
+                        msg1 = str(data.get("msg1", ""))
+                except Exception:
+                    rt_cd, msg1 = "", ""
+
+                # Do not retry deterministic KIS API business rejections (e.g., HTTP 500 with rt_cd='1' & msg1)
+                is_business_error = (rt_cd == "1" and bool(msg1))
 
                 # Transient 5xx retry defense
-                if status_code in (500, 502, 503, 504) and attempt < max_attempts:
+                if status_code in (500, 502, 503, 504) and not is_business_error and attempt < max_attempts:
                     delay = backoffs[attempt - 1] if (attempt - 1) < len(backoffs) else 0.5
                     logger.warning(
                         f"Transient HTTP {status_code} on {method} {url} (attempt {attempt}/{max_attempts}). "
@@ -94,13 +104,6 @@ class KISRestClient:
                     continue
                 break
 
-            try:
-                data = resp.json() if hasattr(resp, "json") else {}
-                if isinstance(data, dict):
-                    rt_cd = str(data.get("rt_cd", ""))
-                    msg1 = str(data.get("msg1", ""))
-            except Exception:
-                pass
             return resp
         finally:
             latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -540,8 +543,7 @@ class KISRestClient:
             "ORD_UNPR": str(price),
             "EXCG_ID_DVSN_CD": exchange,
         }
-        hashkey = self.generate_hashkey(body) if self.cfg.env == "real" else None
-        headers = self._get_headers(tr_id, hashkey=hashkey)
+        headers = self._get_headers(tr_id)
 
         type_str = "MARKET" if order_type == "01" else ("BEST_LIMIT(03)" if order_type == "03" else f"LIMIT@{price}")
         logger.info(f"Submitting BUY order ({exchange}): {symbol} x {qty} @ {type_str}")
@@ -579,8 +581,7 @@ class KISRestClient:
             "ORD_UNPR": str(price),
             "EXCG_ID_DVSN_CD": exchange,
         }
-        hashkey = self.generate_hashkey(body) if self.cfg.env == "real" else None
-        headers = self._get_headers(tr_id, hashkey=hashkey)
+        headers = self._get_headers(tr_id)
 
         type_str = "MARKET" if order_type == "01" else ("BEST_LIMIT(03)" if order_type == "03" else f"LIMIT@{price}")
         logger.info(f"Submitting SELL order ({exchange}): {symbol} x {qty} @ {type_str}")
@@ -617,8 +618,7 @@ class KISRestClient:
             "QTY_ALL_ORD_YN": "Y" if cancel_all else "N",
             "EXCG_ID_DVSN_CD": exchange,
         }
-        hashkey = self.generate_hashkey(body) if self.cfg.env == "real" else None
-        headers = self._get_headers(tr_id, hashkey=hashkey)
+        headers = self._get_headers(tr_id)
 
         logger.info(f"Submitting CANCEL order: ODNO={order_no}, ALL={cancel_all}")
         resp = self._send_request("POST", url, headers=headers, json=body, timeout=5)

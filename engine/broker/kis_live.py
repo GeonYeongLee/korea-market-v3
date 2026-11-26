@@ -103,6 +103,18 @@ class KisLiveBroker(IBroker):
                 positions=dict(self._positions),
             )
 
+    @staticmethod
+    def _format_http_error_detail(resp: Any, err: Exception) -> str:
+        """Extracts structured KIS rt_cd/msg_cd/msg1 fields from an HTTPError response when available."""
+        if resp is not None and hasattr(resp, "json"):
+            try:
+                body = resp.json()
+                if isinstance(body, dict) and any(k in body for k in ("rt_cd", "msg_cd", "msg1")):
+                    return f"rt_cd={body.get('rt_cd')} msg_cd={body.get('msg_cd')} msg1={body.get('msg1')}"
+            except Exception:
+                pass
+        return str(err)
+
     def order_cash_buy(
         self,
         symbol: str,
@@ -125,6 +137,19 @@ class KisLiveBroker(IBroker):
                 order_type=order_type,
             )
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as net_err:
+            if isinstance(net_err, requests.exceptions.HTTPError):
+                resp = getattr(net_err, "response", None)
+                resp_status = getattr(resp, "status_code", 0)
+                # Explicit 4xx/500 HTTP rejection means the order did not enter an ambiguous in-flight state
+                if resp_status not in (502, 503, 504):
+                    err_detail = self._format_http_error_detail(resp, net_err)
+                    logger.error(f"[{self.mode.upper()}] Buy order HTTP {resp_status} rejected for {symbol}: {err_detail}")
+                    if order:
+                        order.status = OrderStatus.REJECTED
+                    return {
+                        "rt_cd": "HTTP_ERROR",
+                        "msg1": err_detail,
+                    }
             logger.warning(
                 f"[{self.mode.upper()}] Buy order network error for {symbol} ({net_err}). "
                 f"Initiating Phase-2 order verification via inquire_daily_ccld..."
@@ -228,6 +253,18 @@ class KisLiveBroker(IBroker):
                 order_type=order_type,
             )
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as net_err:
+            if isinstance(net_err, requests.exceptions.HTTPError):
+                resp = getattr(net_err, "response", None)
+                resp_status = getattr(resp, "status_code", 0)
+                if resp_status not in (502, 503, 504):
+                    err_detail = self._format_http_error_detail(resp, net_err)
+                    logger.error(f"[{self.mode.upper()}] Sell order HTTP {resp_status} rejected for {symbol}: {err_detail}")
+                    if order:
+                        order.status = OrderStatus.REJECTED
+                    return {
+                        "rt_cd": "HTTP_ERROR",
+                        "msg1": err_detail,
+                    }
             logger.warning(
                 f"[{self.mode.upper()}] Sell order network error for {symbol} ({net_err}). "
                 f"Initiating Phase-2 order verification via inquire_daily_ccld..."

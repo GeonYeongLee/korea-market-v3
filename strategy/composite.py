@@ -50,6 +50,7 @@ class CompositeStrategy(BaseStrategy):
         self._forming_bars: Dict[str, MinuteBar] = {}
         self._daily_trade_count: int = 0
         self._pending_ref_bars: Dict[str, Dict[str, Any]] = {}
+        self._rejection_counts: Dict[str, int] = {}
         self._lock = threading.RLock()
 
     @property
@@ -157,6 +158,7 @@ class CompositeStrategy(BaseStrategy):
             self._forming_bars.clear()
             self._daily_trade_count = 0
             self._pending_ref_bars.clear()
+            self._rejection_counts.clear()
 
             bal = context.get_balance() if hasattr(context, "get_balance") else None
             if bal and bal.cash > 0:
@@ -272,7 +274,18 @@ class CompositeStrategy(BaseStrategy):
                     if event.filled_quantity == 0 and not has_filled:
                         self._daily_trade_count = max(0, self._daily_trade_count - 1)
                         self._active_positions.discard(event.symbol)
-                        if hasattr(self.entry, "rollback_entered_symbol"):
+                        is_rejected = event.status == OrderStatus.REJECTED
+                        if is_rejected:
+                            rej_cnt = self._rejection_counts.get(event.symbol, 0) + 1
+                            self._rejection_counts[event.symbol] = rej_cnt
+                        else:
+                            rej_cnt = 0
+                        if is_rejected and rej_cnt >= 3:
+                            logger.error(
+                                f"🛑 [REJECTION LOCKOUT] {event.symbol} rejected {rej_cnt}x today "
+                                f"({event.message}). Suppressing further entry retries."
+                            )
+                        elif hasattr(self.entry, "rollback_entered_symbol"):
                             self.entry.rollback_entered_symbol(event.symbol)
                     self._pending_ref_bars.pop(event.symbol, None)
                 elif event.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
