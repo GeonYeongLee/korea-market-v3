@@ -123,11 +123,14 @@ async def process_condition_candidates(
     if not candidates:
         return
 
+    eval_min = as_of.replace(second=0, microsecond=0)
     if audit_sink is not None:
-        audit_sink.emit("CANDIDATE_POLL", as_of, seq=seq, count=len(candidates), symbols=[c.symbol for c in candidates])
+        poll_sig = (eval_min, seq, tuple(c.symbol for c in candidates))
+        if getattr(strategy, "_last_audit_poll_sig", None) != poll_sig:
+            setattr(strategy, "_last_audit_poll_sig", poll_sig)
+            audit_sink.emit("CANDIDATE_POLL", as_of, seq=seq, count=len(candidates), symbols=list(poll_sig[2]))
 
     active_syms = set(feed.active_symbols())
-    eval_min = as_of.replace(second=0, microsecond=0)
 
     for cand in candidates:
         sym = cand.symbol

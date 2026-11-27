@@ -7,85 +7,45 @@ and sorts per minute by `(dt ASC, turnover DESC, symbol ASC)`.
 from __future__ import annotations
 
 import logging
-import math
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
+import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
+from v4.adapters.backtest._dates import list_trading_dates, parse_date_arg, resolve_data_dir
 from v4.models import MinuteBar
 
 logger = logging.getLogger("korea_market.v4.adapters.backtest.parquet_loader")
 
 
-def resolve_data_dir(custom_path: Optional[str] = None) -> str:
-    """Resolves the available 1-minute partitioned dataset directory."""
-    candidates = [
-        custom_path,
-        "data/dataset_2y/daily",
-        os.path.join("..", "korea-market_v2", "data", "dataset_2y", "daily"),
-    ]
-    for path in candidates:
-        if path and os.path.isdir(path):
-            return path
-    return custom_path or "data/dataset_2y/daily"
-
-
-def parse_date_arg(val: Optional[date | str]) -> Optional[date]:
-    """Parses `date`, `YYYY-MM-DD`, or `YYYYMMDD` into `datetime.date`."""
-    if val is None or isinstance(val, date) and not isinstance(val, datetime):
-        return val
-    if isinstance(val, datetime):
-        return val.date()
-    s = str(val).strip().replace("-", "")
-    if len(s) == 8 and s.isdigit():
-        return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
-    raise ValueError(f"Unsupported date format: {val!r}")
-
-
-def list_trading_dates(
-    data_dir: str, start_date: Optional[date | str] = None, end_date: Optional[date | str] = None
-) -> List[date]:
-    """Returns sorted trading dates available in `data_dir` within `[start_date, end_date]`."""
-    if not os.path.isdir(data_dir):
-        return []
-    s_dt, e_dt = parse_date_arg(start_date), parse_date_arg(end_date)
-    dates: List[date] = []
-    for entry in sorted(os.listdir(data_dir)):
-        if len(entry) != 8 or not entry.isdigit() or not os.path.isdir(os.path.join(data_dir, entry)):
-            continue
-        d_val = date(int(entry[:4]), int(entry[4:6]), int(entry[6:8]))
-        if (s_dt is not None and d_val < s_dt) or (e_dt is not None and d_val > e_dt):
-            continue
-        dates.append(d_val)
-    return dates
-
-
 def _resolve_session_bounds(
-    dts: List[datetime], raw_pms: Optional[List[Optional[bool]]]
+    times: List[time], raw_pms: Optional[List[Optional[bool]]]
 ) -> Tuple[time, time]:
     """Determines `(market_open_time, market_close_time)` from regular-session timestamps."""
     min_reg: Optional[time] = None
     max_reg: Optional[time] = None
-    n = len(dts)
+    t_0900, t_1400, t_1530 = time(9, 0), time(14, 0), time(15, 30)
+    n = len(times)
     for i in range(n):
-        t = dts[i].time()
+        t = times[i]
         pm = raw_pms[i] if raw_pms is not None else None
-        is_pm = bool(pm) if pm is not None else (t < time(9, 0))
+        is_pm = bool(pm) if pm is not None else (t < t_0900)
         if is_pm:
             continue
         if min_reg is None or t < min_reg:
             min_reg = t
-        if t <= time(15, 30) and (max_reg is None or t > max_reg):
+        if t <= t_1530 and (max_reg is None or t > max_reg):
             max_reg = t
 
     if min_reg is None:
-        return time(9, 0), time(15, 30)
-    m_open = time(10, 0) if min_reg.hour >= 10 else time(9, 0)
-    m_close = max_reg if (max_reg is not None and time(14, 0) <= max_reg <= time(15, 30)) else time(15, 30)
+        return t_0900, t_1530
+    m_open = time(10, 0) if min_reg.hour >= 10 else t_0900
+    m_close = max_reg if (max_reg is not None and t_1400 <= max_reg <= t_1530) else t_1530
     return m_open, m_close
 
 
@@ -131,7 +91,21 @@ class DayBarIndex:
 def _col_floats(table: pa.Table, col: str, avail: Set[str], n: int) -> List[float]:
     if col not in avail:
         return [0.0] * n
-    return [float(x) if x is not None and math.isfinite(x) else 0.0 for x in table[col].to_pylist()]
+    arr = table[col].combine_chunks().to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).tolist()
+
+
+def _extract_minute_dts(ts_col: pa.ChunkedArray) -> Tuple[List[datetime], List[time]]:
+    """Extracts interned minute-floored `datetime` and `time` lists via PyArrow."""
+    floored = pc.floor_temporal(ts_col, unit="minute").combine_chunks()
+    uniq_pa = pc.unique(floored)
+    uniq_dts = [
+        (v.to_pydatetime() if hasattr(v, "to_pydatetime") else v).replace(second=0, microsecond=0)
+        for v in uniq_pa.to_pylist()
+    ]
+    uniq_times = [dt.time() for dt in uniq_dts]
+    idx_arr = pc.index_in(floored, value_set=uniq_pa).to_numpy(zero_copy_only=False)
+    return [uniq_dts[i] for i in idx_arr], [uniq_times[i] for i in idx_arr]
 
 
 def _has_parquet_magic(path: str) -> bool:
@@ -197,9 +171,9 @@ def detect_session_times(day_dir: str, trade_date: date) -> Tuple[time, time]:
     table = _read_day_table(day_dir, trade_date, ["symbol", "timestamp", "is_premarket"])
     if table is None or table.num_rows == 0:
         return time(9, 0), time(15, 30)
-    dts = [dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt for dt in table["timestamp"].to_pylist()]
+    _, times = _extract_minute_dts(table["timestamp"])
     raw_pms = table["is_premarket"].to_pylist() if "is_premarket" in table.schema.names else None
-    return _resolve_session_bounds(dts, raw_pms)
+    return _resolve_session_bounds(times, raw_pms)
 
 
 def load_day_bar_index(
@@ -221,19 +195,21 @@ def load_day_bar_index(
     table = table.sort_by(sort_keys)
 
     n = table.num_rows
-    raw_dts = table["timestamp"].to_pylist()
-    dts: List[datetime] = [
-        (dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt).replace(second=0, microsecond=0)
-        for dt in raw_dts
-    ]
+    dts, times = _extract_minute_dts(table["timestamp"])
     raw_pms = table["is_premarket"].to_pylist() if "is_premarket" in avail else None
-    m_open, m_close = _resolve_session_bounds(dts, raw_pms)
+    m_open, m_close = _resolve_session_bounds(times, raw_pms)
 
-    syms = [str(s) for s in table["symbol"].to_pylist()]
+    syms = table["symbol"].to_pylist()
+    if syms and not isinstance(syms[0], str):
+        syms = [str(s) for s in syms]
     opens, highs, lows, closes, tos, vwaps = (
         _col_floats(table, c, avail, n) for c in ("open", "high", "low", "close", "turnover", "vwap")
     )
-    vols = [int(x) if x is not None else 0 for x in table["volume"].to_pylist()] if "volume" in avail else [0] * n
+    if "volume" in avail:
+        v_arr = np.nan_to_num(table["volume"].combine_chunks().to_numpy(zero_copy_only=False), nan=0.0)
+        vols = v_arr.astype(np.int64, copy=False).tolist()
+    else:
+        vols = [0] * n
 
     cum_tos, is_pms = [0.0] * n, [False] * n
     cum_tracker: Dict[str, float] = {}
@@ -247,7 +223,7 @@ def load_day_bar_index(
         ct = cum_tracker.get(sym, 0.0) + tos[i]
         cum_tracker[sym] = cum_tos[i] = ct
         pm = raw_pms[i] if raw_pms is not None else None
-        is_pms[i] = (bool(pm) if pm is not None else False) or (dt.time() < m_open)
+        is_pms[i] = (bool(pm) if pm is not None else False) or (times[i] < m_open)
         if dt != cur_min:
             if cur_min is not None:
                 minute_slices[cur_min] = (cur_start, i)

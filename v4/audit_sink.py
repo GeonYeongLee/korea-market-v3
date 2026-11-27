@@ -31,7 +31,7 @@ class JsonlAuditSink(IAuditSink):
     def __init__(self, file_path: Path) -> None:
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fp: Optional[IO[str]] = self.file_path.open("a", encoding="utf-8", buffering=1)
+        self._fp: Optional[IO[str]] = self.file_path.open("a", encoding="utf-8", buffering=65536)
         self._error_logged: bool = False
 
     def _warn_once(self, action: str, exc: Exception) -> None:
@@ -45,6 +45,8 @@ class JsonlAuditSink(IAuditSink):
         try:
             payload = {"event": event_type, "dt": dt.isoformat(), "symbol": symbol, **data}
             self._fp.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str) + "\n")
+            if event_type in ("ENTRY_SIGNAL", "ORDER_EVENT"):
+                self._fp.flush()
         except Exception as exc:
             self._warn_once("write", exc)
 
