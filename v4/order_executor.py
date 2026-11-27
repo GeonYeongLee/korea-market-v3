@@ -10,7 +10,8 @@ import logging
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
-from v4.interfaces import IBrokerPort, IClock, IRiskGuard
+from v4.audit_sink import NullAuditSink
+from v4.interfaces import IAuditSink, IBrokerPort, IClock, IRiskGuard
 from v4.models import (
     EntrySignal,
     MinuteBar,
@@ -37,6 +38,7 @@ class OrderExecutor:
         risk_guard: IRiskGuard,
         stale_buy_timeout_sec: float = 45.0,
         unsubscribe_if_idle: Optional[Callable[[str], object]] = None,
+        audit_sink: Optional[IAuditSink] = None,
     ) -> None:
         self.strategy = strategy
         self.broker = broker
@@ -44,6 +46,7 @@ class OrderExecutor:
         self.risk_guard = risk_guard
         self.stale_buy_timeout_sec = stale_buy_timeout_sec
         self._unsubscribe_if_idle = unsubscribe_if_idle
+        self.audit_sink: IAuditSink = audit_sink if audit_sink is not None else NullAuditSink()
 
         self._order_queue: asyncio.Queue[OrderEvent] = asyncio.Queue()
         self._buy_submit_times: Dict[str, datetime] = {}
@@ -84,6 +87,18 @@ class OrderExecutor:
         return drained
 
     def _process_order_event(self, ev: OrderEvent) -> None:
+        self.audit_sink.emit(
+            "ORDER_EVENT",
+            ev.dt or self.clock.now(),
+            symbol=ev.symbol,
+            side=ev.side.value,
+            status=ev.status.value,
+            requested_price=ev.requested_price,
+            filled_price=ev.filled_price,
+            filled_quantity=ev.filled_quantity,
+            net_pnl=ev.net_pnl,
+            tag=ev.tag,
+        )
         if ev.side == OrderSide.SELL and ev.status == OrderStatus.FILLED:
             self.risk_guard.on_trade_completed(ev.net_pnl)
         if ev.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED):
@@ -106,6 +121,14 @@ class OrderExecutor:
         bal = self.broker.get_balance()
         avail_cash = bal.cash if bal is not None else None
         qty = self.strategy.compute_order_quantity(signal.collar_cap_price, avail_cash)
+        self.audit_sink.emit(
+            "ENTRY_SIGNAL",
+            self.clock.now(),
+            symbol=symbol,
+            trigger_price=signal.trigger_price,
+            qty=qty,
+            reason=signal.reason,
+        )
         if qty <= 0:
             self.strategy.entry.rollback_entered_symbol(symbol)
             return None

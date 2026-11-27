@@ -299,6 +299,7 @@ def main() -> None:
     bt_parser.add_argument("--dynamic", dest="dynamic", action="store_true", default=True, help="Adaptive variables (default: True)")
     bt_parser.add_argument("--fixed", dest="dynamic", action="store_false", help="Legacy fixed constants")
     bt_parser.add_argument("--no-export", action="store_true", help="Disable automatic CSV export")
+    bt_parser.add_argument("--audit-log", action="store_true", default=False, help="Emit structured JSONL audit log for reconciliation")
     bt_parser.add_argument("--strict-v3-parity", action="store_true", default=False, help="Pin 09:01~09:15 schedule & skip Bar0 SL for v3 cross-validation")
     bt_parser.add_argument("--entry-start", type=int, default=0, help="Entry start minute (0 = 09:00:00)")
     bt_parser.add_argument("--entry-end", type=int, default=10, help="Entry end minute (10 = 09:10:00)")

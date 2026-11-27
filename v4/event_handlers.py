@@ -72,6 +72,7 @@ async def handle_minute_pulse(runner: UnifiedTradingRunner, ev: MinutePulseEvent
         await process_condition_candidates(
             runner.strategy, runner.condition_search, runner.feed,
             runner._day_features, runner._day_prev_closes, ev.dt, seq,
+            audit_sink=runner.audit_sink,
         )
 
 

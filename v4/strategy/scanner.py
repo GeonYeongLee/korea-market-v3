@@ -53,6 +53,7 @@ class AllWeatherScannerV4(IScannerComponent):
         self._last_low_min: Dict[str, datetime] = {}
         self._disqualified_symbols: Set[str] = set()
         self._qualified_symbols: Set[str] = set()
+        self._reject_reasons: Dict[str, str] = {}
         self._condition_symbols: Optional[Set[str]] = None
         self._day_prev_closes: Dict[str, float] = {}
         self._day_features: Dict[str, SymbolFeatures] = {}
@@ -71,6 +72,7 @@ class AllWeatherScannerV4(IScannerComponent):
         self._last_low_min.clear()
         self._disqualified_symbols.clear()
         self._qualified_symbols.clear()
+        self._reject_reasons.clear()
         if self._condition_symbols is not None:
             self._condition_symbols.clear()
         self.market_open_time, self.market_close_time = market_open_time, market_close_time
@@ -85,6 +87,7 @@ class AllWeatherScannerV4(IScannerComponent):
         self._day_features = dict(features) if features else {}
 
     def is_disqualified(self, symbol: str) -> bool: return symbol in self._disqualified_symbols
+    def get_reject_reason(self, symbol: str) -> str: return self._reject_reasons.get(symbol, "")
     def get_day_open(self, symbol: str) -> Optional[float]: return self._day_open_prices.get(symbol)
     def get_prev_close(self, symbol: str) -> Optional[float]: return self._day_prev_closes.get(symbol)
     def set_condition_universe(self, symbols: List[str]) -> None: self._condition_symbols = set(symbols)
@@ -123,20 +126,17 @@ class AllWeatherScannerV4(IScannerComponent):
         if not math.isfinite(mae) or mae < self.max_mae_pct:
             self._disqualified_symbols.add(symbol)
             self._qualified_symbols.discard(symbol)
+            self._reject_reasons[symbol] = "MAE_BREACH"
             return True
         return False
 
+    def _reject(self, symbol: str, reason: str) -> bool:
+        self._reject_reasons[symbol] = reason
+        return False
+
     def _validate_and_finalize(
-        self,
-        symbol: str,
-        eval_dt: datetime,
-        day_open: float,
-        prev_close: float,
-        prior_low: float,
-        post_low: float,
-        surge_pct: Optional[float],
-        surge_flag: bool,
-        cum_turnover: float,
+        self, symbol: str, eval_dt: datetime, day_open: float, prev_close: float,
+        prior_low: float, post_low: float, surge_pct: Optional[float], surge_flag: bool, cum_turnover: float,
     ) -> bool:
         """Single canonical qualification & post-bar MAE record shared by on_bar() & evaluate_candidate()."""
         use_opt_prior = self.execution_mode == "optimistic" and self.optimistic_prior_mae
@@ -144,25 +144,23 @@ class AllWeatherScannerV4(IScannerComponent):
         passed = self._core_filter(symbol, eval_dt, day_open, prev_close, mae_low, surge_pct, surge_flag, cum_turnover)
         if passed:
             self._qualified_symbols.add(symbol)
+            self._reject_reasons.pop(symbol, None)
         if use_opt_prior and self.max_mae_pct is not None and day_open > 0.0 and post_low > 0.0:
             post_mae = (post_low - day_open) / day_open
             if not math.isfinite(post_mae) or post_mae < self.max_mae_pct:
                 self._disqualified_symbols.add(symbol)
                 self._qualified_symbols.discard(symbol)
+                self._reject_reasons[symbol] = "MAE_BREACH"
         return passed
 
     def _core_filter(
-        self,
-        symbol: str,
-        eval_dt: datetime,
-        day_open: float,
-        prev_close: float,
-        mae_low: float,
-        surge_pct: Optional[float],
-        surge_flag: bool,
-        cum_turnover: float,
+        self, symbol: str, eval_dt: datetime, day_open: float, prev_close: float,
+        mae_low: float, surge_pct: Optional[float], surge_flag: bool, cum_turnover: float,
     ) -> bool:
-        if eval_dt.time() < self.start_time or eval_dt.time() > self.end_time or symbol in self._disqualified_symbols:
+        if eval_dt.time() < self.start_time or eval_dt.time() > self.end_time:
+            return self._reject(symbol, "NON_REGULAR")
+        if symbol in self._disqualified_symbols:
+            self._reject_reasons.setdefault(symbol, "MAE_BREACH")
             return False
         if day_open > 0.0:
             if (self.min_gap_pct is not None or self.max_gap_pct is not None) and prev_close > 0.0:
@@ -173,19 +171,21 @@ class AllWeatherScannerV4(IScannerComponent):
                 ):
                     self._disqualified_symbols.add(symbol)
                     self._qualified_symbols.discard(symbol)
-                    return False
+                    return self._reject(symbol, "GAP_OUT")
             if self.max_mae_pct is not None and mae_low > 0.0:
                 mae = (mae_low - day_open) / day_open
                 if not math.isfinite(mae) or mae < self.max_mae_pct:
                     self._disqualified_symbols.add(symbol)
                     self._qualified_symbols.discard(symbol)
-                    return False
+                    return self._reject(symbol, "MAE_BREACH")
         if surge_pct is not None:
             if not math.isfinite(surge_pct) or surge_pct < self.min_body_pct:
-                return False
+                return self._reject(symbol, "SAME_BAR_MISS")
         elif not surge_flag:
-            return False
-        return math.isfinite(cum_turnover) and cum_turnover >= self.effective_min_turnover(symbol)
+            return self._reject(symbol, "SAME_BAR_MISS")
+        if not math.isfinite(cum_turnover) or cum_turnover < self.effective_min_turnover(symbol):
+            return self._reject(symbol, "TURNOVER_LOW")
+        return True
 
     def on_bar(self, current_date: date, bar: MinuteBar) -> Optional[List[str]]:
         nums = (bar.open, bar.high, bar.low, bar.close, bar.turnover, bar.cum_turnover)
@@ -223,7 +223,7 @@ class AllWeatherScannerV4(IScannerComponent):
         sym = cand.symbol
         eval_dt = cand.as_of or cand.bar_dt or (recent_bars[-1].dt if recent_bars else (snapshot.as_of if snapshot else None))
         if eval_dt is None:
-            return False
+            return self._reject(sym, "MISSING_PRICES")
 
         reg_bars = [
             b for b in (recent_bars or [])

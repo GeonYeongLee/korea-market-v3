@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 
-from v4.interfaces import IConditionSearchPort, IRealtimeFeedPort
+from v4.interfaces import IAuditSink, IConditionSearchPort, IRealtimeFeedPort
 from v4.models import ConditionCandidate, IntradaySnapshot, MinuteBar, SymbolFeatures, TickEvent
 from v4.strategy.composite import CompositeStrategyV4
 
@@ -111,6 +111,7 @@ async def process_condition_candidates(
     prev_closes: Dict[str, float],
     as_of: datetime,
     seq: str,
+    audit_sink: Optional[IAuditSink] = None,
 ) -> None:
     """
     Polls HTS condition search (`HHKST03900400`) and enforces:
@@ -121,6 +122,9 @@ async def process_condition_candidates(
     candidates = await condition_search.poll_candidates(as_of, seq=seq)
     if not candidates:
         return
+
+    if audit_sink is not None:
+        audit_sink.emit("CANDIDATE_POLL", as_of, seq=seq, count=len(candidates), symbols=[c.symbol for c in candidates])
 
     active_syms = set(feed.active_symbols())
     eval_min = as_of.replace(second=0, microsecond=0)
@@ -152,21 +156,45 @@ async def process_condition_candidates(
         if not fast_pass:
             recent_bars = await condition_search.get_recent_minute_bars(sym, as_of, limit=30)
 
-        if strategy.scanner.evaluate_candidate(cand, snapshot=snapshot, recent_bars=recent_bars):
-            is_nxt = resolve_is_nxt(sym, cand, snapshot, features)
+        passed_eval = strategy.scanner.evaluate_candidate(cand, snapshot=snapshot, recent_bars=recent_bars)
+        is_nxt = resolve_is_nxt(sym, cand, snapshot, features)
+        day_open = (
+            strategy.scanner.get_day_open(sym)
+            or cand.day_open
+            or (snapshot.day_open if snapshot is not None else 0.0)
+        )
+        krx_day_low = cand.krx_day_low or (snapshot.day_low if snapshot is not None else 0.0)
+        cum_turnover = max(cand.krx_cum_turnover, snapshot.cum_turnover if snapshot is not None else 0.0)
+
+        if passed_eval:
             if not await feed.subscribe(sym, is_nxt=is_nxt):
+                if audit_sink is not None:
+                    audit_sink.emit(
+                        "CANDIDATE_GATE", as_of, symbol=sym, seq=eff_seq, passed=False, reason="WS_CAP_FULL",
+                        day_open=day_open, krx_day_low=krx_day_low, cum_turnover=cum_turnover,
+                        eff_min_turnover=eff_min_to, is_nxt=is_nxt,
+                    )
                 continue
+            if audit_sink is not None:
+                audit_sink.emit(
+                    "CANDIDATE_GATE", as_of, symbol=sym, seq=eff_seq, passed=True, reason="PASSED",
+                    day_open=day_open, krx_day_low=krx_day_low, cum_turnover=cum_turnover,
+                    eff_min_turnover=eff_min_to, is_nxt=is_nxt,
+                )
             active_syms.add(sym)
-            day_open = (
-                strategy.scanner.get_day_open(sym)
-                or cand.day_open
-                or (snapshot.day_open if snapshot is not None else 0.0)
-            )
             if day_open > 0.0:
                 strategy.entry.register_day_open(sym, day_open)
             strategy._active_candidates.add(sym)
             strategy._candidate_bar_min[sym] = eval_min
             _seed_forming_or_mid_promoted(strategy, sym, eval_min, cand, snapshot, recent_bars)
-        elif strategy.scanner.is_disqualified(sym) and sym in active_syms:
-            await feed.unsubscribe(sym)
-            active_syms.discard(sym)
+        else:
+            if audit_sink is not None:
+                reason = strategy.scanner.get_reject_reason(sym) or "REJECTED"
+                audit_sink.emit(
+                    "CANDIDATE_GATE", as_of, symbol=sym, seq=eff_seq, passed=False, reason=reason,
+                    day_open=day_open, krx_day_low=krx_day_low, cum_turnover=cum_turnover,
+                    eff_min_turnover=eff_min_to, is_nxt=is_nxt,
+                )
+            if strategy.scanner.is_disqualified(sym) and sym in active_syms:
+                await feed.unsubscribe(sym)
+                active_syms.discard(sym)

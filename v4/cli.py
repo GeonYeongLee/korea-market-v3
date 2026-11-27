@@ -9,16 +9,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime, time
+from pathlib import Path
 from typing import Optional
 
 from rich.console import Console
 
+from config.settings import settings
 from engine.metrics import PerformanceSummary, calculate_performance
 from v4.adapters.backtest import (
     BacktestBrokerAdapter, BacktestClock, BacktestConditionSearchAdapter, BacktestRealtimeFeed,
     CurrentDayStore, ParquetRegimeDataAdapter, list_trading_dates, parse_date_arg, resolve_data_dir,
 )
+from v4.audit_sink import JsonlAuditSink, NullAuditSink
 from v4.cli_report import render_dual_report, render_init_banner, render_single_report
+from v4.interfaces import IAuditSink
 from v4.models import ExecutionMode
 from v4.risk import DailyRiskGuard
 from v4.runner import UnifiedTradingRunner
@@ -31,6 +35,7 @@ def build_v4_runner(
     data_dir: str,
     day_store: CurrentDayStore,
     regime_adapter: ParquetRegimeDataAdapter,
+    audit_sink: Optional[IAuditSink] = None,
 ) -> UnifiedTradingRunner:
     """Wires an isolated `UnifiedTradingRunner` sharing `day_store` and `regime_adapter`."""
     capital = float(getattr(args, "capital", 10_000_000.0))
@@ -89,6 +94,7 @@ def build_v4_runner(
         broker=broker,
         risk_guard=risk_guard,
         execution_mode=execution_mode,
+        audit_sink=audit_sink,
     )
     runner_ref.append(runner)
     return runner
@@ -100,6 +106,7 @@ async def run_v4_backtest_async(
     data_dir: str,
     day_store: Optional[CurrentDayStore] = None,
     regime_adapter: Optional[ParquetRegimeDataAdapter] = None,
+    audit_sink: Optional[IAuditSink] = None,
 ) -> PerformanceSummary:
     """Executes one deterministic async `UnifiedTradingRunner` backtest pass."""
     capital = float(getattr(args, "capital", 10_000_000.0))
@@ -110,7 +117,7 @@ async def run_v4_backtest_async(
         end_date=getattr(args, "end", None),
         day_store=store,
     )
-    runner = build_v4_runner(args, execution_mode, data_dir, store, regime)
+    runner = build_v4_runner(args, execution_mode, data_dir, store, regime, audit_sink=audit_sink)
     s_dt = parse_date_arg(getattr(args, "start", None))
     e_dt = parse_date_arg(getattr(args, "end", None))
     trades = await runner.run(start_date=s_dt, end_date=e_dt)
@@ -122,11 +129,13 @@ async def run_v4_dual_backtest_async(
     data_dir: str,
     day_store: CurrentDayStore,
     regime_adapter: ParquetRegimeDataAdapter,
+    pess_audit_sink: Optional[IAuditSink] = None,
+    opti_audit_sink: Optional[IAuditSink] = None,
 ) -> tuple[PerformanceSummary, PerformanceSummary]:
     """Executes 1-pass day-by-day dual-bounds backtest sharing each day's `DayBarIndex`."""
     capital = float(getattr(args, "capital", 10_000_000.0))
-    pess_runner = build_v4_runner(args, "pessimistic", data_dir, day_store, regime_adapter)
-    opti_runner = build_v4_runner(args, "optimistic", data_dir, day_store, regime_adapter)
+    pess_runner = build_v4_runner(args, "pessimistic", data_dir, day_store, regime_adapter, audit_sink=pess_audit_sink)
+    opti_runner = build_v4_runner(args, "optimistic", data_dir, day_store, regime_adapter, audit_sink=opti_audit_sink)
     s_dt = parse_date_arg(getattr(args, "start", None))
     e_dt = parse_date_arg(getattr(args, "end", None))
     for d in list_trading_dates(data_dir, s_dt, e_dt):
@@ -143,6 +152,7 @@ def run_v4_backtest(
     data_dir: str,
     day_store: Optional[CurrentDayStore] = None,
     regime_adapter: Optional[ParquetRegimeDataAdapter] = None,
+    audit_sink: Optional[IAuditSink] = None,
 ) -> PerformanceSummary:
     """Executes one deterministic `UnifiedTradingRunner` backtest pass."""
     return asyncio.run(
@@ -152,6 +162,7 @@ def run_v4_backtest(
             data_dir=data_dir,
             day_store=day_store,
             regime_adapter=regime_adapter,
+            audit_sink=audit_sink,
         )
     )
 
@@ -167,13 +178,35 @@ def cmd_v4_backtest(args: argparse.Namespace, console: Optional[Console] = None)
     shared_regime = ParquetRegimeDataAdapter(
         data_dir=data_dir, start_date=getattr(args, "start", None), end_date=getattr(args, "end", None), day_store=shared_store
     )
+    tag = f"{getattr(args, 'start', 'all')}_{getattr(args, 'end', 'all')}".replace("-", "")
+    use_audit = bool(getattr(args, "audit_log", False))
+
+    def _make_sink(suffix: str) -> IAuditSink:
+        if not use_audit:
+            return NullAuditSink()
+        return JsonlAuditSink(Path(settings.logs_dir) / f"v4_audit_backtest_{tag}_{suffix}.jsonl")
 
     if args.mode in ("pessimistic", "optimistic"):
-        summary = run_v4_backtest(
-            args, execution_mode=args.mode, data_dir=data_dir, day_store=shared_store, regime_adapter=shared_regime
-        )
-        render_single_report(out, args, summary)
+        audit_sink = _make_sink(args.mode)
+        try:
+            summary = run_v4_backtest(
+                args, execution_mode=args.mode, data_dir=data_dir,
+                day_store=shared_store, regime_adapter=shared_regime, audit_sink=audit_sink,
+            )
+            render_single_report(out, args, summary)
+        finally:
+            audit_sink.close()
         return
 
-    pess, opti = asyncio.run(run_v4_dual_backtest_async(args, data_dir, shared_store, shared_regime))
-    render_dual_report(out, args, pess, opti, capital)
+    pess_sink, opti_sink = _make_sink("pessimistic"), _make_sink("optimistic")
+    try:
+        pess, opti = asyncio.run(
+            run_v4_dual_backtest_async(
+                args, data_dir, shared_store, shared_regime,
+                pess_audit_sink=pess_sink, opti_audit_sink=opti_sink,
+            )
+        )
+        render_dual_report(out, args, pess, opti, capital)
+    finally:
+        pess_sink.close()
+        opti_sink.close()

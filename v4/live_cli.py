@@ -11,6 +11,7 @@ import asyncio
 import logging
 import sys
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Optional
 
 from rich.console import Console
@@ -25,6 +26,7 @@ from v4.adapters.kis import (
     KisRealtimeFeed,
     KisRegimeDataAdapter,
 )
+from v4.audit_sink import JsonlAuditSink
 from v4.risk import DailyRiskGuard
 from v4.runner import UnifiedTradingRunner
 from v4.strategy.factory import build_v4_strategy
@@ -115,6 +117,7 @@ async def run_v4_live_async(
     if not getattr(args, "nowait", False):
         await _wait_until_preopen(clock, index_regime.market_open_time, out)
 
+    audit_sink = JsonlAuditSink(Path(cfg.logs_dir) / f"v4_audit_live_{today:%Y%m%d}.jsonl")
     runner = UnifiedTradingRunner(
         strategy=strategy,
         clock=clock,
@@ -125,11 +128,13 @@ async def run_v4_live_async(
         risk_guard=risk_guard,
         execution_mode="pessimistic",
         is_live_tick_driven=True,
+        audit_sink=audit_sink,
     )
     try:
         trades = await runner.run(start_date=today, end_date=today)
         out.print(f"[bold green]✓ Session completed. Total closed trades: {len(trades)}[/bold green]")
     finally:
+        audit_sink.close()
         await feed.stop()
 
 

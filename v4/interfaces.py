@@ -280,3 +280,15 @@ class IExitComponent(ABC):
         Super Leader, or body-center SL inside Bar 0; skipped when `execution_mode == "optimistic"`).
         Phase 2+ evaluates ref/trailing SL, TP, and `hard_timeout` (`15:21` or `< market_close_time`).
         """
+
+
+class IAuditSink(ABC):
+    """Structured audit trail sink for live/backtest reconciliation (zero-overhead when NullAuditSink)."""
+
+    @abstractmethod
+    def emit(self, event_type: str, dt: datetime, symbol: str = "", **data: Any) -> None:
+        """Emits a structured audit event."""
+
+    def close(self) -> None:
+        """Flushes and closes any underlying sink resources."""
+        return None

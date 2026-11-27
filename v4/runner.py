@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import date, time
 from typing import Dict, List, Optional
 
+from v4.audit_sink import NullAuditSink
 from v4.event_handlers import (
     entry_blocked,
     handle_bar_close,
@@ -16,7 +17,7 @@ from v4.event_handlers import (
     unsubscribe_if_idle,
 )
 from v4.interfaces import (
-    IBrokerPort, IClock, IConditionSearchPort, IRealtimeFeedPort, IRegimeDataPort, IRiskGuard,
+    IAuditSink, IBrokerPort, IClock, IConditionSearchPort, IRealtimeFeedPort, IRegimeDataPort, IRiskGuard,
 )
 from v4.models import (
     BarCloseEvent, ExecutionMode, MarketEvent, MinutePulseEvent, Position, SymbolFeatures, TickEvent, TradeRecord,
@@ -40,6 +41,7 @@ class UnifiedTradingRunner:
         execution_mode: ExecutionMode = "pessimistic",
         stale_buy_timeout_sec: float = 45.0,
         is_live_tick_driven: bool = False,
+        audit_sink: Optional[IAuditSink] = None,
     ) -> None:
         self.strategy = strategy
         self.clock = clock
@@ -50,6 +52,7 @@ class UnifiedTradingRunner:
         self.risk_guard = risk_guard
         self.execution_mode: ExecutionMode = execution_mode
         self.is_live_tick_driven = is_live_tick_driven
+        self.audit_sink: IAuditSink = audit_sink if audit_sink is not None else NullAuditSink()
 
         self.broker.set_execution_mode(self.execution_mode)
         self.executor = OrderExecutor(
@@ -59,6 +62,7 @@ class UnifiedTradingRunner:
             risk_guard=risk_guard,
             stale_buy_timeout_sec=stale_buy_timeout_sec,
             unsubscribe_if_idle=self._unsubscribe_if_idle,
+            audit_sink=self.audit_sink,
         )
 
         self._current_date: Optional[date] = None
