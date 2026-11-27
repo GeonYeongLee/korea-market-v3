@@ -135,9 +135,27 @@ def _query_dataset(
     return ds_obj.to_table(columns=avail, filter=filt)
 
 
+def _packed_file_for(day_dir: str, trade_date: date) -> str:
+    norm = os.path.normpath(day_dir)
+    base_dir = os.path.dirname(norm)
+    packed_root = os.path.join(os.path.dirname(base_dir), f"{os.path.basename(base_dir)}_packed")
+    return os.path.join(packed_root, f"{trade_date:%Y%m%d}.parquet")
+
+
 def _read_day_table(
-    day_dir: str, trade_date: date, columns: List[str], symbols: Optional[Set[str]] = None
+    day_dir: str,
+    trade_date: date,
+    columns: List[str],
+    symbols: Optional[Set[str]] = None,
+    use_packed: bool = True,
 ) -> Optional[pa.Table]:
+    if use_packed:
+        packed_path = _packed_file_for(day_dir, trade_date)
+        if os.path.isfile(packed_path):
+            try:
+                return _query_dataset([packed_path], trade_date, columns, symbols)
+            except (pa.ArrowInvalid, OSError) as exc:
+                logger.warning(f"Packed parquet read failed ({packed_path}): {exc}; falling back to raw dir.")
     if not os.path.isdir(day_dir):
         return None
     files = [os.path.join(day_dir, f) for f in os.listdir(day_dir) if f.endswith(".parquet")]
@@ -188,11 +206,13 @@ def load_day_bar_index(
         return DayBarIndex(trade_date=trade_date)
 
     avail = set(table.schema.names)
-    sort_keys = [("timestamp", "ascending")]
-    if "turnover" in avail:
-        sort_keys.append(("turnover", "descending"))
-    sort_keys.append(("symbol", "ascending"))
-    table = table.sort_by(sort_keys)
+    is_presorted = symbols is None and (table.schema.metadata or {}).get(b"v4_sorted") == b"1"
+    if not is_presorted:
+        sort_keys = [("timestamp", "ascending")]
+        if "turnover" in avail:
+            sort_keys.append(("turnover", "descending"))
+        sort_keys.append(("symbol", "ascending"))
+        table = table.sort_by(sort_keys)
 
     n = table.num_rows
     dts, times = _extract_minute_dts(table["timestamp"])

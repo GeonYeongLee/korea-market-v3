@@ -362,6 +362,13 @@ def main() -> None:
     check_parser.add_argument("--env", choices=["vts", "real"], default="vts", help="Environment to check (vts/real)")
     check_parser.add_argument("--skip-ws", action="store_true", help="Skip WebSocket connectivity handshake")
 
+    # pack-data
+    pack_parser = subparsers.add_parser("pack-data", help="Pack daily per-symbol parquets into single-file presorted caches")
+    pack_parser.add_argument("--start", default=None, help="Start date (YYYY-MM-DD or YYYYMMDD)")
+    pack_parser.add_argument("--end", default=None, help="End date (YYYY-MM-DD or YYYYMMDD)")
+    pack_parser.add_argument("--data-dir", default=None, help="Dataset directory path")
+    pack_parser.add_argument("--overwrite", action="store_true", help="Overwrite existing packed files")
+
     args = parser.parse_args()
 
     if args.command == "strategies":
@@ -380,6 +387,10 @@ def main() -> None:
         cmd_routine(args)
     elif args.command == "check-live":
         cmd_check_live(args)
+    elif args.command == "pack-data":
+        from v4.adapters.backtest.packer import pack_trading_days
+        packed, skipped = pack_trading_days(args.data_dir, args.start, args.end, overwrite=args.overwrite)
+        console.print(f"[green]Packed {packed} day(s), skipped {skipped} day(s).[/green]")
     else:
         parser.print_help()
 
