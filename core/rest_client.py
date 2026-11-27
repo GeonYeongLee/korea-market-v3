@@ -16,6 +16,7 @@ from config.settings import Settings, settings
 from core.auth import TokenManager
 from core.rate_limiter import RateLimiter, get_rate_limiter
 from core.krx_ticks import round_to_krx_tick
+from core.krx_symbols import get_nxt_symbols
 from core.telemetry import telemetry
 
 logger = logging.getLogger("kis.rest")
@@ -40,6 +41,8 @@ class KISRestClient:
         adapter = HTTPAdapter(pool_connections=15, pool_maxsize=20, max_retries=1)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        self._order_exchanges: Dict[str, str] = {}
+        self._last_psearch_warn_ts: Dict[str, float] = {}
 
     @property
     def base_url(self) -> str:
@@ -170,7 +173,7 @@ class KISRestClient:
             logger.warning(f"get_volume_rank({market_div}) returned code {data.get('rt_cd')}: {data.get('msg1')}")
             return []
 
-        return data.get("output", [])
+        return data.get("output") or []
 
     def get_volume_rank(
         self,
@@ -284,7 +287,7 @@ class KISRestClient:
         if data.get("rt_cd") != "0":
             logger.warning(f"get_fluctuation_rank({market_div}) returned code {data.get('rt_cd')}: {data.get('msg1')}")
             return []
-        return data.get("output", [])
+        return data.get("output") or []
 
     def get_fluctuation_rank(
         self,
@@ -375,59 +378,51 @@ class KISRestClient:
         resp = self._send_request("GET", url, headers=headers, params=params, timeout=5)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("output", {})
+        return data.get("output") or {}
 
     def get_today_minute_bars(
         self,
         symbol: str,
         to_hour: Optional[str] = None,
-        market_div: str = "UN",  # 'UN': KRX+NXT 통합 분봉 우선, 미지원 종목은 'J'로 자동 폴백
+        market_div: str = "J",  # 'J': KRX 정규장 분봉 우선 (UN 0거래량 더미·NXT 프리마켓 오염 방지)
     ) -> List[Dict[str, Any]]:
         """
         주식 당일 분봉 조회 (TR: FHKST03010200).
         장중 실시간 주도주 발굴 시(구독 시점) 09:00부터 현재까지의 공인 1분봉 데이터를
         1회 즉시 동기화하여 진입 조건 및 기준봉 손절선을 완전체로 복원합니다.
-        1차로 market_div='UN'(KRX+NXT 통합)을 시도하며,
-        넥스트레이드 비대상 종목으로 인해 거래량이 0인 경우 2차로 'J'(KRX 정규장)로 자동 폴백하여
-        모든 종목의 정확한 시초가와 통합 거래대금을 완전하게 수집합니다.
+        기본적으로 'J'(KRX 정규장)를 우선 조회하여 UN 더미봉(cntg_vol=0)을 방지하고,
+        유효 거래량 봉이 전혀 없는 경우에만 대체 시장구분으로 폴백합니다.
         """
-        self.limiter.acquire_sync()
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
         tr_id = "FHKST03010200"
-        headers = self._get_headers(tr_id)
         raw_hour = to_hour or datetime.now().strftime("%H%M%S")
         hour_str = min(raw_hour, "153000") if raw_hour > "153000" else raw_hour
-        params = {
-            "FID_COND_MRKT_DIV_CODE": market_div,
-            "FID_INPUT_ISCD": symbol,
-            "FID_INPUT_HOUR_1": hour_str,
-            "FID_PW_DATA_INCU_YN": "N",
-            "FID_ETC_CLS_CODE": "",
-        }
-        bars: List[Dict[str, Any]] = []
-        try:
-            resp = self._send_request("GET", url, headers=headers, params=params, timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("rt_cd") == "0":
-                bars = data.get("output2", [])
-        except Exception as e:
-            logger.debug(f"get_today_minute_bars({symbol}, {market_div}) failed: {e}")
 
-        # Check if UN returned real trading volume (NXT supported stock)
-        # If UN returned only 0-volume placeholder bars (non-NXT stock like 020400), fallback to 'J' (KRX)
-        has_volume = any(float(b.get("cntg_vol") or 0) > 0 for b in bars)
-        if market_div != "J" and (not bars or not has_volume):
-            params["FID_COND_MRKT_DIV_CODE"] = "J"
+        def _fetch_valid_bars(m_div: str) -> List[Dict[str, Any]]:
+            self.limiter.acquire_sync()
+            headers = self._get_headers(tr_id)
+            params = {
+                "FID_COND_MRKT_DIV_CODE": m_div,
+                "FID_INPUT_ISCD": symbol,
+                "FID_INPUT_HOUR_1": hour_str,
+                "FID_PW_DATA_INCU_YN": "N",
+                "FID_ETC_CLS_CODE": "",
+            }
             try:
-                self.limiter.acquire_sync()
                 resp = self._send_request("GET", url, headers=headers, params=params, timeout=5)
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("rt_cd") == "0":
-                    bars = data.get("output2", [])
+                    raw_out = data.get("output2") or []
+                    return [b for b in raw_out if float(b.get("cntg_vol") or b.get("volume") or 0) > 0]
             except Exception as e:
-                logger.warning(f"get_today_minute_bars fallback to 'J' failed for {symbol}: {e}")
+                logger.warning(f"get_today_minute_bars({symbol}, {m_div}) failed: {e}")
+            return []
+
+        bars = _fetch_valid_bars(market_div)
+        if not bars:
+            fallback_div = "J" if market_div != "J" else "UN"
+            bars = _fetch_valid_bars(fallback_div)
 
         return bars
 
@@ -451,7 +446,7 @@ class KISRestClient:
         if data.get("rt_cd") != "0":
             logger.warning(f"get_condition_search_title returned {data.get('rt_cd')}: {data.get('msg1')}")
             return []
-        return data.get("output2", []) or data.get("output", [])
+        return data.get("output2") or data.get("output") or []
 
     def get_condition_search_result(self, seq: str = "0") -> List[Dict[str, Any]]:
         """
@@ -472,9 +467,17 @@ class KISRestClient:
         resp.raise_for_status()
         data = resp.json()
         if data.get("rt_cd") != "0":
-            logger.warning(f"get_condition_search_result(seq={seq}) returned {data.get('rt_cd')}: {data.get('msg1')}")
+            rt_cd = str(data.get("rt_cd", ""))
+            msg1 = str(data.get("msg1", ""))
+            warn_key = f"{seq}:{rt_cd}:{msg1}"
+            now_ts = time.monotonic()
+            if (now_ts - self._last_psearch_warn_ts.get(warn_key, 0.0)) >= 30.0:
+                self._last_psearch_warn_ts[warn_key] = now_ts
+                logger.warning(f"get_condition_search_result(seq={seq}) returned {rt_cd}: {msg1}")
+            else:
+                logger.debug(f"get_condition_search_result(seq={seq}) returned {rt_cd}: {msg1}")
             return []
-        return data.get("output2", []) or data.get("output", [])
+        return data.get("output2") or data.get("output") or []
 
     # =========================================================================
     # 2. Account & Balance APIs
@@ -505,13 +508,79 @@ class KISRestClient:
         resp.raise_for_status()
         data = resp.json()
         return {
-            "holdings": data.get("output1", []),
-            "summary": data.get("output2", [{}])[0] if data.get("output2") else {},
+            "holdings": data.get("output1") or [],
+            "summary": (data.get("output2") or [{}])[0] if (data.get("output2") or []) else {},
         }
 
     # =========================================================================
     # 3. Order Execution APIs
     # =========================================================================
+
+    def _resolve_order_exchange(self, symbol: Optional[str] = None, exchange: Optional[str] = None, order_no: str = "") -> str:
+        """Selects order exchange: KRX for VTS/non-NXT stocks, SOR for NXT-eligible REAL stocks."""
+        if exchange is not None:
+            return exchange
+        if getattr(self.cfg, "env", "real") == "vts":
+            return "KRX"
+        if order_no and order_no in self._order_exchanges:
+            return self._order_exchanges[order_no]
+        if symbol:
+            nxt_syms = get_nxt_symbols()
+            return "SOR" if (nxt_syms and symbol in nxt_syms) else "KRX"
+        return "SOR"
+
+    def _submit_cash_order(
+        self,
+        side: str,
+        tr_id: str,
+        symbol: str,
+        qty: int,
+        price: int = 0,
+        order_type: str = "01",
+        exchange: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Submits BUY/SELL order with KRX routing for non-NXT and automatic KRX fallback on SOR rejection."""
+        if price > 0:
+            price = round_to_krx_tick(float(price), side=side)
+
+        auto_exchange = exchange is None
+        eff_exchange = self._resolve_order_exchange(symbol=symbol, exchange=exchange)
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+        type_str = "MARKET" if order_type == "01" else ("BEST_LIMIT(03)" if order_type == "03" else f"LIMIT@{price}")
+
+        def _post(exch: str) -> Dict[str, Any]:
+            self.limiter.acquire_sync()
+            body = {
+                "CANO": self.cfg.account_no,
+                "ACNT_PRDT_CD": self.cfg.account_prdt_cd,
+                "PDNO": symbol,
+                "ORD_DVSN": order_type,
+                "ORD_QTY": str(qty),
+                "ORD_UNPR": str(price),
+                "EXCG_ID_DVSN_CD": exch,
+            }
+            headers = self._get_headers(tr_id)
+            logger.info(f"Submitting {side} order ({exch}): {symbol} x {qty} @ {type_str}")
+            resp = self._send_request("POST", url, headers=headers, json=body, timeout=5)
+            resp.raise_for_status()
+            return resp.json()
+
+        data = _post(eff_exchange)
+        if (
+            auto_exchange
+            and eff_exchange == "SOR"
+            and data.get("rt_cd") != "0"
+            and "SOR" in str(data.get("msg1", "")).upper()
+        ):
+            logger.warning(f"{side} order SOR rejected for {symbol} ({data.get('msg1')}); retrying on KRX...")
+            eff_exchange = "KRX"
+            data = _post("KRX")
+
+        if data.get("rt_cd") == "0":
+            odno = str((data.get("output") or {}).get("ODNO") or "")
+            if odno:
+                self._order_exchanges[odno] = eff_exchange
+        return data
 
     def order_cash_buy(
         self,
@@ -519,37 +588,21 @@ class KISRestClient:
         qty: int,
         price: int = 0,
         order_type: str = "01",  # "01": 시장가, "00": 지정가, "03": 최유리지정가
-        exchange: Optional[str] = None,  # Defaults: "KRX" for VTS, "SOR" for REAL
+        exchange: Optional[str] = None,  # Defaults: "KRX" for VTS/non-NXT, "SOR" for NXT REAL
     ) -> Dict[str, Any]:
         """
         현금 매수 주문 (TR: VTTC0012U for VTS, TTTC0012U for REAL).
         Conforms strictly to KRX tick rules via round_to_krx_tick.
         """
-        if exchange is None:
-            exchange = "KRX" if getattr(self.cfg, "env", "real") == "vts" else "SOR"
-
-        if price > 0:
-            price = round_to_krx_tick(float(price), side="BUY")
-
-        self.limiter.acquire_sync()
-        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
-        tr_id = self.cfg.endpoints.tr_buy
-        body = {
-            "CANO": self.cfg.account_no,
-            "ACNT_PRDT_CD": self.cfg.account_prdt_cd,
-            "PDNO": symbol,
-            "ORD_DVSN": order_type,
-            "ORD_QTY": str(qty),
-            "ORD_UNPR": str(price),
-            "EXCG_ID_DVSN_CD": exchange,
-        }
-        headers = self._get_headers(tr_id)
-
-        type_str = "MARKET" if order_type == "01" else ("BEST_LIMIT(03)" if order_type == "03" else f"LIMIT@{price}")
-        logger.info(f"Submitting BUY order ({exchange}): {symbol} x {qty} @ {type_str}")
-        resp = self._send_request("POST", url, headers=headers, json=body, timeout=5)
-        resp.raise_for_status()
-        return resp.json()
+        return self._submit_cash_order(
+            side="BUY",
+            tr_id=self.cfg.endpoints.tr_buy,
+            symbol=symbol,
+            qty=qty,
+            price=price,
+            order_type=order_type,
+            exchange=exchange,
+        )
 
     def order_cash_sell(
         self,
@@ -557,37 +610,21 @@ class KISRestClient:
         qty: int,
         price: int = 0,
         order_type: str = "01",  # "01": 시장가, "00": 지정가, "03": 최유리지정가
-        exchange: Optional[str] = None,  # Defaults: "KRX" for VTS, "SOR" for REAL
+        exchange: Optional[str] = None,  # Defaults: "KRX" for VTS/non-NXT, "SOR" for NXT REAL
     ) -> Dict[str, Any]:
         """
         현금 매도 주문 (TR: VTTC0011U for VTS, TTTC0011U for REAL).
         Conforms strictly to KRX tick rules via round_to_krx_tick.
         """
-        if exchange is None:
-            exchange = "KRX" if getattr(self.cfg, "env", "real") == "vts" else "SOR"
-
-        if price > 0:
-            price = round_to_krx_tick(float(price), side="SELL")
-
-        self.limiter.acquire_sync()
-        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
-        tr_id = self.cfg.endpoints.tr_sell
-        body = {
-            "CANO": self.cfg.account_no,
-            "ACNT_PRDT_CD": self.cfg.account_prdt_cd,
-            "PDNO": symbol,
-            "ORD_DVSN": order_type,
-            "ORD_QTY": str(qty),
-            "ORD_UNPR": str(price),
-            "EXCG_ID_DVSN_CD": exchange,
-        }
-        headers = self._get_headers(tr_id)
-
-        type_str = "MARKET" if order_type == "01" else ("BEST_LIMIT(03)" if order_type == "03" else f"LIMIT@{price}")
-        logger.info(f"Submitting SELL order ({exchange}): {symbol} x {qty} @ {type_str}")
-        resp = self._send_request("POST", url, headers=headers, json=body, timeout=5)
-        resp.raise_for_status()
-        return resp.json()
+        return self._submit_cash_order(
+            side="SELL",
+            tr_id=self.cfg.endpoints.tr_sell,
+            symbol=symbol,
+            qty=qty,
+            price=price,
+            order_type=order_type,
+            exchange=exchange,
+        )
 
     def order_cancel(
         self,
@@ -596,12 +633,12 @@ class KISRestClient:
         qty: int = 0,
         cancel_all: bool = True,
         exchange: Optional[str] = None,
+        symbol: str = "",
     ) -> Dict[str, Any]:
         """
         주문 취소 (TR: VTTC0013U for VTS, TTTC0013U for REAL).
         """
-        if exchange is None:
-            exchange = "KRX" if getattr(self.cfg, "env", "real") == "vts" else "SOR"
+        exchange = self._resolve_order_exchange(symbol=symbol or None, exchange=exchange, order_no=order_no)
 
         self.limiter.acquire_sync()
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
@@ -659,7 +696,7 @@ class KISRestClient:
         resp = self._send_request("GET", url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("output1", [])
+        return data.get("output1") or []
 
     def get_kospi_gap_and_market_regime(self) -> Dict[str, Any]:
         """

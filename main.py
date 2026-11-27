@@ -27,16 +27,7 @@ from engine.broker.backtest import BacktestBroker
 from engine.datafeed.historical import HistoricalDataFeed
 from engine.risk.risk_manager import RiskManager
 from engine.engine import TradingEngine
-from engine.metrics import (
-    PerformanceSummary,
-    render_dual_bounds_table,
-    render_exit_distribution_table,
-)
-from engine.trade_reporter import (
-    export_trades_to_csv,
-    render_trades_table,
-    save_backtest_reports,
-)
+from engine.metrics import PerformanceSummary
 from strategy.registry import build_strategy, SCANNERS, ENTRIES, EXITS
 from audit.universal_auditor import UniversalStrategyAuditor
 
@@ -148,63 +139,10 @@ def cmd_strategies() -> None:
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
-    """Runs deterministic backtest with assembled CompositeStrategy."""
-    data_dir = resolve_data_dir(args.data_dir)
+    """Runs unified v4 deterministic backtest with rich metrics & CSV export."""
+    from v4.cli import cmd_v4_backtest
 
-    slots_info = (
-        "Dynamic (Dual-Index Regime 2 vs 5 slots)"
-        if args.slots is None
-        else f"Fixed ({args.slots} slots)"
-    )
-
-    console.print(Panel(
-        f"[bold cyan]Korea Market v3 Backtest Engine[/bold cyan]\n"
-        f"• Exec Mode : [yellow]{args.mode.upper()}[/yellow] | Scanner: [yellow]{args.scanner}[/yellow]\n"
-        f"• Entry     : [yellow]{args.entry}[/yellow] | Exit: [yellow]{args.exit}[/yellow]\n"
-        f"• Regime    : [magenta]{getattr(args, 'regime_mode', 'all')}[/magenta] | Sizing: [green]{slots_info}[/green]\n"
-        f"• Range     : [white]{args.start or 'Full'} ~ {args.end or 'Latest'}[/white]\n"
-        f"• Capital   : [white]{args.capital:,.0f} KRW[/white]\n"
-        f"• Data Dir  : [dim]{data_dir}[/dim]",
-        title="[bold green]🚀 Initializing Pure Minute-Bar Simulation[/bold green]",
-        expand=False,
-    ))
-
-    if args.mode in ("pessimistic", "optimistic"):
-        summary = run_single_backtest(args, ambiguity_mode=args.mode, data_dir=data_dir)
-        console.print(summary.render_rich_table())
-        console.print(render_exit_distribution_table(summary))
-        console.print(render_trades_table(summary.trades))
-        if not args.no_export:
-            save_backtest_reports(
-                summary.trades, args.scanner, args.start, args.end, args.mode, args.export_csv, console
-            )
-    elif args.mode == "dual":
-        pess_summary = run_single_backtest(args, ambiguity_mode="pessimistic", data_dir=data_dir)
-        opti_summary = run_single_backtest(args, ambiguity_mode="optimistic", data_dir=data_dir)
-        console.print("")
-        console.print(render_dual_bounds_table(pess_summary, opti_summary, initial_capital=args.capital))
-        console.print("")
-        console.print(render_exit_distribution_table(pess_summary, opti_summary))
-
-        pnl_spread = opti_summary.total_net_pnl - pess_summary.total_net_pnl
-        spread_pct = (pnl_spread / args.capital) * 100
-
-        if spread_pct <= 3.0:
-            verdict = f"[bold green]🛡️ High Robustness Passed (Ambiguity Spread: {spread_pct:.2f}%)[/bold green]"
-        elif spread_pct <= 10.0:
-            verdict = f"[bold yellow]⚠️ Moderate Sensitivity (Ambiguity Spread: {spread_pct:.2f}%)[/bold yellow]"
-        else:
-            verdict = f"[bold red]🚨 High Ambiguity Warning (Ambiguity Spread: {spread_pct:.2f}%)[/bold red]"
-        console.print(Panel(verdict, title="Verdict", expand=False))
-
-        console.print("")
-        console.print(render_trades_table(pess_summary.trades))
-        if not args.no_export:
-            console.print("")
-            p_custom = f"{os.path.splitext(args.export_csv)[0]}_pessimistic{os.path.splitext(args.export_csv)[1]}" if args.export_csv else None
-            o_custom = f"{os.path.splitext(args.export_csv)[0]}_optimistic{os.path.splitext(args.export_csv)[1]}" if args.export_csv else None
-            save_backtest_reports(pess_summary.trades, args.scanner, args.start, args.end, "pessimistic", p_custom, console)
-            save_backtest_reports(opti_summary.trades, args.scanner, args.start, args.end, "optimistic", o_custom, console)
+    cmd_v4_backtest(args, console=console)
 
 
 def cmd_audit(args: argparse.Namespace) -> None:
@@ -288,6 +226,12 @@ def cmd_live(args: argparse.Namespace) -> None:
         ))
         sys.exit(1)
 
+    if getattr(args, "v4", False):
+        from v4.live_cli import cmd_v4_live
+
+        cmd_v4_live(args, console=console)
+        return
+
     from engine.daily_routine import DailyRoutineOrchestrator
     orchestrator = DailyRoutineOrchestrator(
         mode="live",
@@ -355,6 +299,7 @@ def main() -> None:
     bt_parser.add_argument("--dynamic", dest="dynamic", action="store_true", default=True, help="Adaptive variables (default: True)")
     bt_parser.add_argument("--fixed", dest="dynamic", action="store_false", help="Legacy fixed constants")
     bt_parser.add_argument("--no-export", action="store_true", help="Disable automatic CSV export")
+    bt_parser.add_argument("--strict-v3-parity", action="store_true", default=False, help="Pin 09:01~09:15 schedule & skip Bar0 SL for v3 cross-validation")
     bt_parser.add_argument("--entry-start", type=int, default=0, help="Entry start minute (0 = 09:00:00)")
     bt_parser.add_argument("--entry-end", type=int, default=10, help="Entry end minute (10 = 09:10:00)")
     bt_parser.add_argument("--entry-style", choices=["orb", "pullback", "volume_surge"], default="orb", help="Entry style")
@@ -397,6 +342,8 @@ def main() -> None:
     live_parser.add_argument("--exit", default="all_weather", help="Exit module name")
     live_parser.add_argument("--capital", type=float, default=10_000_000.0, help="Initial capital in KRW")
     live_parser.add_argument("--nowait", action="store_true", help="Skip waiting for 09:00 market open")
+    live_parser.add_argument("--v4", action="store_true", help="Use unified v4 KIS REAL-live engine")
+    live_parser.add_argument("--dry-run", action="store_true", help="Run pre-market sync only without starting event loop (v4)")
 
     # routine
     routine_parser = subparsers.add_parser("routine", help="Run daily automated orchestrator")

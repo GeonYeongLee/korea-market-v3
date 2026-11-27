@@ -14,7 +14,8 @@
 - **Zero-Gap Realized Profit (실전 수익 무결성)**: 모든 연구와 개발의 종착점은 실전 계좌의 지속 가능한 순익이다. 백테스트와 실전 매매 간의 괴리를 0%로 수렴시키며, 화면 속 뻥튀기 수익률(과적합, 미래 참조, 모호봉 왜곡)을 원천 차단한다.
 - **AI Supervisor & Subagent Delegation**: 메인 어시스턴트는 항상 시스템 총괄 **감독자(Supervisor)** 역할을 수행하며, 심층 분석, 코드베이스 감사, 리팩토링, 구현 등 모든 실무 작업은 전문 서브에이전트(`invoke_subagent`)를 띄워 위임하고 결과를 취합·통제한다.
 - **Lego-Block Modularity**: 모든 전략은 `CompositeStrategy(scanner=..., entry=..., exit=...)` 조립형으로만 구현. 단일 모놀리스 전략 클래스 생성 절대 금지, 개별 모듈 300줄 이내(SRP) 강제.
-- **Bar 0 Causal Integrity (Lookahead 0%)**: [docs/00_FAILURES_AND_LESSONS.md](docs/00_FAILURES_AND_LESSONS.md) Rule 0 준수. 어떤 진입/청산 모듈이든 진입 분봉(Bar 0) 미완성 상태에서 미래의 High/Close를 당겨와 목표가를 계산하는 행위 원천 차단.
+- **Bar 0 Causal Integrity (Lookahead 0%)**: [docs/00_FAILURES_AND_LESSONS.md](docs/00_FAILURES_AND_LESSONS.md) Rule 0 준수. 어떤 진입/청산 모듈이든 진입 분봉(Bar 0) 미완성 상태에서 미래의 High/Close를 당겨와 목표가를 계산하는 행위 원천 차단. (단, 조건검색 포착과 같은 분 진입 평가 시 `bar.close` 의존 조건 배제 및 Bar 0 내 Phase 1 비상 손절만 활성)
+- **KRX-Only Condition Search & KRX/NXT Separation**: HTS 조건검색(`HHKST03900400`)은 KRX 전용이므로 KRX+NXT 동시 운영 시간대 거래대금은 조건검색 단독 신뢰 금지. 장중 WS는 백테스트 통합 데이터 정합성을 위해 **NXT 대상 종목은 `H0UNCNT0`("UN")**, **비-NXT(KRX 단독) 종목은 `H0STCNT0`("J")** 로 반드시 분기(11-26 실전 로그에서 비-NXT 종목의 `H0UNCNT0` 틱 0건 수신 확인). REST 시세(`"UN"` → `"J"` 폴백)와 누적 스냅샷 조회(`as_of` 인과성 보장)에서도 NXT 프리마켓(`08:00~08:50`) `day_open`/`day_low` 오염을 엄격히 분리.
 - **Dual-Bounds Ambiguity Audit**: 모호봉(동일 분봉 내 TP/SL 동시 도달) 발생 시 전략 평가는 반드시 **비관적(SL 우선, 하한)**과 **낙관적(TP 우선, 상한)** 2가지 케이스의 스프레드를 함께 분석하여 봉 내부 노이즈 과적합 검증.
 - **KRX Tick Conformance**: 모든 주문/청산 가격은 반드시 `core.krx_ticks.round_to_krx_tick()`을 거쳐 법정 호가로 반올림 (매수: Floor, 매도: Ceil).
 - **DIP (Dependency Inversion Principle)**: 전략 코드는 백테스트/실전 100% 동일 유지. 오직 `IBroker`, `IClock`, `IDataFeed` 주입 부품만 교체.

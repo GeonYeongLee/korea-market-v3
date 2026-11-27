@@ -244,6 +244,40 @@ def test_order_inquiry(client: KISRestClient) -> tuple[bool, Dict[str, Any]]:
         return False, {"status": "FAIL", "error": str(e)}
 
 
+def test_v4_adapters_readiness(cfg: Settings) -> tuple[bool, Dict[str, Any]]:
+    """Verifies v4.adapters.kis imports, NXT metadata, and H0UNCNT0/H0STCNT0 WS routing."""
+    try:
+        from v4.adapters.kis import (
+            KisConditionSearchAdapter,
+            KisLiveBrokerAdapter,
+            KisLiveClock,
+            KisRealtimeFeed,
+            KisRegimeDataAdapter,
+        )
+        from v4.adapters.kis.regime_data import load_nxt_symbol_set
+
+        nxt_set = load_nxt_symbol_set("data/metadata/nxt_symbols.json")
+        feed = KisRealtimeFeed(cfg=cfg, nxt_symbols=nxt_set or {"005930"})
+        nxt_tr = feed._resolve_tr_id("005930", True)
+        krx_tr = feed._resolve_tr_id("999990", False)
+        if nxt_tr != "H0UNCNT0" or krx_tr != "H0STCNT0":
+            return False, {"status": "FAIL", "error": f"Unexpected WS routing: {nxt_tr}/{krx_tr}"}
+
+        _ = (
+            KisConditionSearchAdapter,
+            KisLiveBrokerAdapter,
+            KisLiveClock,
+            KisRegimeDataAdapter,
+        )
+        return True, {
+            "status": "PASS",
+            "nxt_count": len(nxt_set) if nxt_set is not None else 0,
+            "routing": f"NXT={nxt_tr}, KRX={krx_tr}",
+        }
+    except Exception as exc:
+        return False, {"status": "FAIL", "error": str(exc)}
+
+
 async def test_websocket_handshake(cfg: Settings) -> tuple[bool, Dict[str, Any]]:
     """Test 7: WebSocket Handshake & Connectivity."""
     import asyncio
@@ -466,6 +500,17 @@ def run_preflight_checks(env_override: Optional[str] = None, skip_ws: bool = Fal
         console.print("  [dim]ℹ️ WebSocket 점검을 건너뜁니다 (--skip-ws).[/dim]")
     console.print()
 
+    # 6b. v4 Adapters & NXT/KRX WS Routing Readiness
+    v4_ok, v4_res = test_v4_adapters_readiness(cfg)
+    if v4_ok:
+        v4_detail = f"{v4_res.get('routing')} (NXT 종목: {v4_res.get('nxt_count')}개)"
+        checklist.append(("v4 KIS 어댑터 & WS 라우팅", "PASS", v4_detail))
+        console.print(f"  [green]✓[/green] v4 KIS 어댑터 & NXT/KRX WS 라우팅 정상 ({v4_detail})")
+    else:
+        checklist.append(("v4 KIS 어댑터 & WS 라우팅", "FAIL", v4_res.get("error", "오류")))
+        console.print(f"  [red]✗[/red] v4 KIS 어댑터 점검 실패: {v4_res.get('error')}")
+    console.print()
+
     # 7. Final Go / No-Go Decision Table
     all_passed = all(st == "PASS" for item_name, st, _ in checklist if item_name != "실시간 WebSocket 연결" or not skip_ws)
     status_text = "[bold green]🎯 LIVE TRADING READY (실전매매 가동 적격)[/bold green]" if all_passed else "[bold red]⚠️ ACTION REQUIRED (일부 항목 점검 필요)[/bold red]"
@@ -483,8 +528,7 @@ def run_preflight_checks(env_override: Optional[str] = None, skip_ws: bool = Fal
     console.print(Panel.fit(
         f"종합 판정: {status_text}\n"
         f"가동 명령어:\n"
-        f"  - 모의투자 가동: [bold green]python main.py mock[/bold green]\n"
-        f"  - 실전투자 가동: [bold red]python main.py live --yes[/bold red]\n"
+        f"  - 실전투자 가동 (v4): [bold red]python main.py live --v4 --yes[/bold red]\n"
         f"  - 전자동 데일리 루틴: [bold cyan]python main.py routine --mode mock[/bold cyan]",
         border_style="green" if all_passed else "red"
     ))
